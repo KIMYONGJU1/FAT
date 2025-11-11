@@ -19,6 +19,10 @@ FAT AutoFill Pro (v2.0)
 {{ ms_munsell_code }}, {{ ms_ip }}, {{ ms_rating }}, {{ ms_dwg_no }}, {{ ms_rev_no }},
 {{ gsp_paint }}, {{ gsp_ip }}, {{ gsp_quantity }}, {{ gsp_dwg_no }}, {{ gsp_rev_no }}
 
+Function Test of GSP 항목을 사용하려면 다음 placeholder도 추가하세요.
+
+{{ gsp_function_no1 }}, {{ gsp_function_no2 }}
+
 동작 원리(요약)
 ----------------
 - 표지(1p): REV(우선) → 실패 시 파일명 REV.M 폴백, DWG No., Hull No., CLASS 표(리스트/범위) 파싱
