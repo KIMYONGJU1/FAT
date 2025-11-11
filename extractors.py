@@ -6,7 +6,8 @@ FAT AutoFill Extractors (v2.0)
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+from collections import defaultdict
 import os, re
 import pdfplumber
 
@@ -66,37 +67,29 @@ def read_text(pdf_path: str, max_pages: int = 20) -> str:
 SN_BLOCK = re.compile(r'SN\d{4}(?:/\d{2})*')
 
 def _expand_sn_block(block: str) -> List[str]:
-    m = re.match(r'SN(\d{4})((?:/\d{2})*)$', block.replace(' ', ''))
+    token = block.replace(' ', '')
+    m = re.match(r'SN(\d{4})(.*)$', token)
     if not m:
         return []
     base = int(m.group(1))
-    out = [f"SN{base}"]
-    for two in re.findall(r'/(\d{2})', m.group(2) or ''):
-        out.append(f"SN{(base//100)*100 + int(two)}")
-    # === post-processing from NAME PLATE/GENERAL SPEC ===
-    try:
-        cap = extract_tr_capacity(msbd_text)
-        if cap:
-            out['ms_tr_capacity'] = cap
-    except Exception:
-        pass
-    try:
-        ms_ip, gsp_ip = extract_ip_grade(msbd_text, gsp_text)
-        if ms_ip:
-            out['ms_ip'] = ms_ip
-        if gsp_ip:
-            out['gsp_ip'] = gsp_ip
-    except Exception:
-        pass
-    # class from NAME PLATE (OTHER)
-    try:
-        hull = out.get('hull_no') or ''
-        cls_guess = guess_class_from_nameplate_other(msbd_text, hull)
-        if cls_guess:
-            out['class'] = cls_guess
-    except Exception:
-        pass
-    return out
+    tail = m.group(2) or ''
+    codes = {f"SN{base:04d}"}
+
+    range_match = re.search(r'~\s*(\d{4})', tail)
+    if range_match:
+        end = int(range_match.group(1))
+        lo, hi = sorted((base, end))
+        for val in range(lo, hi + 1):
+            codes.add(f"SN{val:04d}")
+
+    for part in re.findall(r'/\s*(\d{2,4})', tail):
+        if len(part) == 4:
+            codes.add(f"SN{int(part):04d}")
+        else:
+            prefix = str(base)[:4-len(part)]
+            codes.add(f"SN{int(prefix + part):04d}")
+
+    return sorted(codes)
 
 def guess_class_from_nameplate_other(text: str, hull_no: str) -> Optional[str]:
     cls = None
@@ -535,7 +528,7 @@ def parse_panel_blocks_v2(msbd_pdf: str, gsp_pdf: str) -> List[Dict[str, object]
             p["circuits"] = [x for x in cir if x.startswith("P32-")]
         # Merge fallback with coordinate-based ACB SETTING TABLE (only fill empty fields)
         try:
-            pinfos = extract_panel_info_from_msbd(msbd_pdf_path)
+            pinfos = _extract_panel_info_from_acb_table(msbd_pdf)
             if isinstance(pinfos, list):
                 norm = {p.get("panel","").upper(): p for p in pinfos}
                 for p in panels:
@@ -648,69 +641,361 @@ def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
         m = re.search(r"\bIP\s*([0-9]{2})\b", txt)
         return f"IP{m.group(1)}" if m else ""
 
+PANEL_FIELD_ORDER = [
+    "panel",
+    "acb_type",
+    "ocr_type",
+    "ampere_frame",
+    "rated_current_in",
+    "ip",
+    "paint",
+    "ir_percent",
+    "ir_amps",
+    "isd_percent",
+    "isd_amps",
+    "setting_time_s",
+    "setting_time_ms",
+    "remarks",
+]
+
+HEADER_ALIASES = {
+    "panel": ("PANEL", "PANELNAME", "PANELINFORMATION"),
+    "acb_type": ("AIRCIRCUITBREAKER", "ACBTYPE", "ACBMODEL"),
+    "ocr_type": ("OVERCURRENTTRIPTYPE", "OCRTYPE", "TRIPUNIT"),
+    "ampere_frame": ("AMPEREFRAME", "AF", "MCR"),
+    "rated_current_in": ("RATEDCURRENTIN", "INA", "IN"),
+    "ip": ("DEGREEOFPROTECTION", "IP"),
+    "paint": ("PAINT", "MUNSELL"),
+    "ir_percent": ("IRPERCENT", "IR"),
+    "ir_amps": ("IRA",),
+    "isd_percent": ("ISDPERCENT", "ISD"),
+    "isd_amps": ("ISDA",),
+    "setting_time_s": ("TIMESEC", "TIMES", "SECONDS"),
+    "setting_time_ms": ("TIMEMSEC", "TIMEMS", "MILLISECONDS"),
+    "remarks": ("REMARK", "NOTE"),
+}
+
+
+def _is_dark_color(color) -> bool:
+    try:
+        if isinstance(color, (tuple, list)) and color:
+            return sum(float(c) for c in color) / len(color) < 0.6
+        if isinstance(color, (int, float)):
+            return float(color) < 0.6
+    except Exception:
+        return False
+    return False
+
+
+def _cells_from_rects(page) -> List[Dict[str, float]]:
+    rects = getattr(page, "rects", None) or []
+    cells: List[Dict[str, float]] = []
+    seen = set()
+    for rect in rects:
+        x0, x1 = rect.get("x0"), rect.get("x1")
+        y0, y1 = rect.get("y0"), rect.get("y1")
+        if None in (x0, x1, y0, y1):
+            continue
+        width = x1 - x0
+        height = y1 - y0
+        if width < 40 or height < 18:
+            continue
+        if width > page.width * 0.95 and height > page.height * 0.95:
+            continue
+        stroke = rect.get("stroke") or rect.get("stroking_color") or rect.get("non_stroking_color")
+        if stroke is not None and not _is_dark_color(stroke):
+            continue
+        top = max(0.0, page.height - y1)
+        bottom = min(page.height, page.height - y0)
+        key = (round(x0, 1), round(x1, 1), round(top, 1), round(bottom, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        cells.append({"x0": x0, "x1": x1, "top": top, "bottom": bottom})
+    return cells
+
+
+def _cells_from_image(pdf_path: str, page_index: int, page) -> List[Dict[str, float]]:
+    try:
+        from pdf2image import convert_from_path
+        import numpy as np
+        import cv2
+    except Exception:
+        return []
+    try:
+        images = convert_from_path(pdf_path, dpi=220, first_page=page_index + 1, last_page=page_index + 1)
+    except Exception:
+        return []
+    if not images:
+        return []
+    img = np.array(images[0])
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    scale = max(1, int(img.shape[1] / 900))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3 * scale, 3 * scale))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    width_scale = img.shape[1] / float(page.width or 1)
+    height_scale = img.shape[0] / float(page.height or 1)
+    cells: List[Dict[str, float]] = []
+    seen = set()
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 40 * scale or h < 18 * scale:
+            continue
+        if w > img.shape[1] * 0.95 and h > img.shape[0] * 0.95:
+            continue
+        ratio = w / float(max(h, 1))
+        if ratio < 0.4 or ratio > 20:
+            continue
+        px0 = x / width_scale
+        px1 = (x + w) / width_scale
+        ptop = y / height_scale
+        pbottom = (y + h) / height_scale
+        key = (round(px0, 1), round(px1, 1), round(ptop, 1), round(pbottom, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+        cells.append({"x0": px0, "x1": px1, "top": ptop, "bottom": pbottom})
+    return cells
+
+
+def _text_from_chars(chars: List[Dict[str, Any]], page_height: float) -> str:
+    if not chars:
+        return ""
+    lines: Dict[float, List[Dict[str, Any]]] = defaultdict(list)
+    for ch in chars:
+        text = ch.get("text", "")
+        if not text:
+            continue
+        top = ch.get("top")
+        if top is None:
+            y1 = ch.get("y1")
+            if y1 is None:
+                continue
+            top = page_height - y1
+        lines[round(float(top), 1)].append(ch)
+    out_lines: List[str] = []
+    for _, group in sorted(lines.items(), key=lambda kv: kv[0]):
+        ordered = sorted(group, key=lambda item: item.get("x0", 0.0))
+        text = "".join(item.get("text", "") for item in ordered)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if text:
+            out_lines.append(text)
+    return "\n".join(out_lines)
+
+
+def _assign_text_to_cells(page, cells: List[Dict[str, Any]]) -> None:
+    for cell in cells:
+        cell["chars"] = []
+    chars = getattr(page, "chars", []) or []
+    for ch in chars:
+        text = ch.get("text", "")
+        if not text:
+            continue
+        cx = (ch.get("x0", 0.0) + ch.get("x1", 0.0)) / 2.0
+        if "top" in ch and "bottom" in ch:
+            cy = (ch["top"] + ch["bottom"]) / 2.0
+        else:
+            cy = page.height - ((ch.get("y0", 0.0) + ch.get("y1", 0.0)) / 2.0)
+        for cell in cells:
+            if cell["x0"] <= cx <= cell["x1"] and cell["top"] - 1.0 <= cy <= cell["bottom"] + 1.0:
+                cell.setdefault("chars", []).append(ch)
+                break
+    for cell in cells:
+        cell["text"] = _text_from_chars(cell.get("chars", []), page.height)
+
+
+def _cluster_rows(cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not cells:
+        return rows
+    for cell in sorted(cells, key=lambda c: (c["top"], c["x0"])):
+        center = (cell["top"] + cell["bottom"]) / 2.0
+        matched = False
+        for row in rows:
+            if abs(center - row["center"]) <= 4.0:
+                row["cells"].append(cell)
+                row["center"] = (row["center"] * (len(row["cells"]) - 1) + center) / len(row["cells"])
+                matched = True
+                break
+        if not matched:
+            rows.append({"center": center, "cells": [cell]})
+    for row in rows:
+        row["cells"].sort(key=lambda c: c["x0"])
+    rows.sort(key=lambda r: r["center"])
+    return rows
+
+
+def _match_panel_header(text: str) -> Optional[str]:
+    if not text:
+        return None
+    norm = re.sub(r'[^A-Z0-9]', '', text.upper())
+    if not norm:
+        return None
+    for key, tokens in HEADER_ALIASES.items():
+        for token in tokens:
+            if token and token in norm:
+                return key
+    return None
+
+
+def _normalize_panel_value(key: str, value: str) -> str:
+    text = re.sub(r'\s+', ' ', (value or '').strip())
+    if not text:
+        return ''
+    if key in {"acb_type", "ocr_type"}:
+        return text.upper()
+    if key == "panel":
+        return text
+    if key in {"ampere_frame", "rated_current_in", "ir_amps", "isd_amps", "setting_time_s", "setting_time_ms"}:
+        nums = re.findall(r'\d+', text)
+        return nums[0] if nums else text
+    if key in {"ir_percent", "isd_percent"}:
+        m = re.search(r'\d{1,3}', text)
+        return m.group(0) if m else text
+    if key == "ip":
+        m = re.search(r'(\d{2})', text)
+        return f"IP{int(m.group(1)):02d}" if m else text.upper()
+    return text
+
+
+def _build_panel_records(page, cells: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not cells:
+        return []
+    _assign_text_to_cells(page, cells)
+    rows = _cluster_rows(cells)
+    header_keys: List[Optional[str]] = []
+    data_rows: List[List[Dict[str, Any]]] = []
+    for row in rows:
+        mapped = [_match_panel_header(cell.get("text", "")) for cell in row["cells"]]
+        if not header_keys and any(mapped):
+            header_keys = mapped
+            continue
+        if header_keys:
+            data_rows.append(row["cells"])
+    if not header_keys:
+        return []
+    results: List[Dict[str, Any]] = []
+    for cells_row in data_rows:
+        record = {k: "" for k in PANEL_FIELD_ORDER}
+        for idx, cell in enumerate(cells_row):
+            if idx >= len(header_keys):
+                break
+            key = header_keys[idx]
+            if not key:
+                continue
+            text = cell.get("text", "").replace("\n", " ").strip()
+            if text:
+                record[key] = _normalize_panel_value(key, text)
+        if record.get("panel"):
+            results.append(record)
+    return results
+
+
+def _extract_panel_table_fallback(page) -> List[Dict[str, Any]]:
+    try:
+        words = page.extract_words() or []
+    except Exception:
+        words = []
+    panels = []
+    for w in words:
+        txt = w.get("text", "").upper().strip()
+        if re.match(r"NO\.\s*\d+\s+INCOMING", txt) or txt in (
+            "BUS-TIE",
+            "BUS TIE",
+            "EMERGENCY PANEL",
+            "LINK TO EM'CY SWITCHBOARD",
+            "LINK TO EM’CY SWITCHBOARD",
+        ):
+            panels.append((txt, (w["x0"] + w["x1"]) / 2.0))
+    panels = sorted({(name, cx) for name, cx in panels}, key=lambda item: item[1])
+    if not panels:
+        return []
+
+    cols = []
+    for i, (name, cx) in enumerate(panels):
+        x_left = (panels[i - 1][1] + cx) / 2.0 if i > 0 else cx - 120
+        x_right = (cx + panels[i + 1][1]) / 2.0 if i < len(panels) - 1 else cx + 120
+        cols.append((name, x_left, x_right))
+
+    def find_row_y(pattern: str) -> Optional[float]:
+        hits = [((w["top"] + w["bottom"]) / 2.0) for w in words if re.search(pattern, w.get("text", "").upper())]
+        if not hits:
+            return None
+        hits.sort()
+        return hits[len(hits) // 2]
+
+    y_acb = find_row_y(r"AIR\s+CIRCUIT\s+BREAKER\s+TYPE|ACB\s*TYPE|ACB\s*MODEL")
+    y_ocr = find_row_y(r"OVERCURRENT\s+TRIP\s+TYPE|TRIP\s*UNIT|OCR\s*TYPE")
+    y_af = find_row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b")
+    y_in = find_row_y(r"RATED\s+CURRENT|\bI[NO]\b")
+
+    def words_in_band(x0: float, x1: float, center_y: float, band: float = 8.0) -> List[Dict[str, Any]]:
+        return [
+            w
+            for w in words
+            if x0 <= (w["x0"] + w["x1"]) / 2.0 <= x1 and abs(((w["top"] + w["bottom"]) / 2.0) - center_y) <= band
+        ]
+
+    rows: List[Dict[str, Any]] = []
+    for name, x0, x1 in cols:
+        info = {k: "" for k in PANEL_FIELD_ORDER}
+        info["panel"] = name
+        if y_acb is not None:
+            cands = [w["text"].upper() for w in words_in_band(x0, x1, y_acb)]
+            picks = [t for t in cands if re.match(r"[A-Z]{2,}[0-9]{2,}", t)]
+            if picks:
+                info["acb_type"] = picks[0]
+        if y_ocr is not None:
+            cands = [w["text"].upper() for w in words_in_band(x0, x1, y_ocr)]
+            picks = [t for t in cands if re.match(r"[A-Z]{2,}", t)]
+            if picks:
+                info["ocr_type"] = picks[0]
+        if y_af is not None:
+            nums = [re.sub(r"[^0-9]", "", w["text"]) for w in words_in_band(x0, x1, y_af)]
+            nums = [n for n in nums if n]
+            if nums:
+                info["ampere_frame"] = nums[0]
+        if y_in is not None:
+            nums = [re.sub(r"[^0-9]", "", w["text"]) for w in words_in_band(x0, x1, y_in)]
+            nums = [n for n in nums if n]
+            if nums:
+                info["rated_current_in"] = nums[0]
+        rows.append(info)
+    return rows
+
+
 # -----------------------------------------------
 # PANEL INFORMATION from MSBD "ACB SETTING TABLE"
 # -----------------------------------------------
-def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:
-    """Coordinate-based, best-effort extraction of panel information."""
-    result = []
+def _extract_panel_info_from_acb_table(msbd_pdf_path: str) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
     try:
-        import pdfplumber, re
-        with pdfplumber.open(msbd_pdf_path) as pdf:
-            target = None
-            for page in pdf.pages:
-                t = (page.extract_text() or "").upper()
-                if "ACB" in t and "SETTING" in t and "TABLE" in t:
-                    target = page
-                    break
-            if target is None:
-                return result
-            words = target.extract_words() or []
-            panels = []
-            for w in words:
-                txt = w["text"].upper().strip()
-                if re.match(r"NO\.\s*\d+\s+INCOMING", txt) or txt in ("BUS-TIE","BUS TIE","EMERGENCY PANEL","LINK TO EM'CY SWITCHBOARD","LINK TO EM’CY SWITCHBOARD"):
-                    panels.append((txt, (w["x0"]+w["x1"]) / 2.0))
-            panels = sorted({(n,x) for n,x in panels}, key=lambda v: v[1])
-            if not panels:
-                return result
-            cols = []
-            for i,(name,cx) in enumerate(panels):
-                x_left = (panels[i-1][1] + cx)/2.0 if i>0 else cx-120
-                x_right = (cx + panels[i+1][1])/2.0 if i < len(panels)-1 else cx+120
-                cols.append((name, x_left, x_right))
-            def find_row_y(pattern):
-                ys = [ ((w["top"]+w["bottom"]) / 2.0) for w in words if re.search(pattern, w["text"].upper()) ]
-                if not ys: return None
-                ys.sort()
-                return ys[len(ys)//2]
-            y_acb = find_row_y(r"AIR\s+CIRCUIT\s+BREAKER\s+TYPE|ACB\s*TYPE|ACB\s*MODEL")
-            y_ocr = find_row_y(r"OVERCURRENT\s+TRIP\s+TYPE|TRIP\s*UNIT|OCR\s*TYPE")
-            y_af  = find_row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b")
-            y_in  = find_row_y(r"RATED\s+CURRENT|\bI[NO]\b")
-            def words_in_band(x0,x1,y,band=8.0):
-                return [w for w in words if x0 <= (w["x0"]+w["x1"]) / 2.0 <= x1 and abs(((w["top"]+w["bottom"]) / 2.0)-y) <= band]
-            for name, x0, x1 in cols:
-                info = {"panel":name, "acb_type":"", "ocr_type":"", "ampere_frame":"", "rated_current_in":"", "ip":"", "paint":"",
-                        "ir_percent":"", "isd_percent":"", "setting_time_s":"", "setting_time_ms":""}
-                if y_acb is not None:
-                    cands = [w["text"].upper() for w in words_in_band(x0,x1,y_acb)]
-                    m = [t for t in cands if re.match(r"[A-Z]{2,}[0-9]{2,}", t)]
-                    if m: info["acb_type"] = m[0]
-                if y_ocr is not None:
-                    cands = [w["text"].upper() for w in words_in_band(x0,x1,y_ocr)]
-                    m = [t for t in cands if re.match(r"[A-Z]{2,}", t)]
-                    if m: info["ocr_type"] = m[0]
-                if y_af is not None:
-                    nums = [re.sub(r"[^0-9]","", w["text"]) for w in words_in_band(x0,x1,y_af)]
-                    nums = [n for n in nums if n]
-                    if nums: info["ampere_frame"] = nums[0]
-                if y_in is not None:
-                    nums = [re.sub(r"[^0-9]","", w["text"]) for w in words_in_band(x0,x1,y_in)]
-                    nums = [n for n in nums if n]
-                    if nums: info["rated_current_in"] = nums[0]
-                result.append(info)
+        import pdfplumber
+    except Exception:
         return result
+
+    try:
+        with pdfplumber.open(msbd_pdf_path) as pdf:
+            target_index = None
+            for idx, page in enumerate(pdf.pages):
+                text_u = (page.extract_text() or "").upper()
+                if "ACB" in text_u and "SETTING" in text_u and "TABLE" in text_u:
+                    target_index = idx
+                    break
+            if target_index is None:
+                return result
+
+            page = pdf.pages[target_index]
+            cells = _cells_from_rects(page)
+            if len(cells) < 12:
+                cells = _cells_from_image(msbd_pdf_path, target_index, page)
+            records = _build_panel_records(page, cells)
+            if not records:
+                records = _extract_panel_table_fallback(page)
+            return records
     except Exception:
         return result
 
@@ -1075,14 +1360,10 @@ def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:  #
         return result
 
 # ---------------------------
-# override: force IP fallback to IP22 (GENERAL SPEC page only)
+# override: checkbox detection backed by pdf2image + OpenCV (GENERAL SPEC page only)
 # This definition intentionally appears at the end of the module to override any earlier versions.
 def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[override]
-    """
-    Determine IP grade from the GENERAL SPEC page. If no checked IP can be detected,
-    ALWAYS fall back to 'IP22' as per user's requirement.
-    Accepts *args/**kwargs to remain compatible with older call sites.
-    """
+    """Determine IP grade from the GENERAL SPEC page using pdf2image + OpenCV."""
     try:
         import re
         try:
@@ -1090,56 +1371,231 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
         except Exception:
             return "IP22"
 
+        try:
+            from pdf2image import convert_from_path  # type: ignore
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            convert_from_path = None  # type: ignore
+            cv2 = None  # type: ignore
+            np = None  # type: ignore
+
         def is_general_spec_page(text: str) -> bool:
             t = (text or "").upper()
             return ("GENERAL" in t and "SPEC" in t)
 
-        with pdfplumber.open(pdf_path) as pdf:  # type: ignore
-            target = None
-            for p in pdf.pages:
-                if is_general_spec_page(p.extract_text() or ""):
-                    target = p
-                    break
-            if target is None:
-                return "IP22"
+        target_index = 0
+        page_width = 0.0
+        page_height = 0.0
+        tokens: List[Tuple[int, Dict[str, float]]] = []
+        chars: List[Dict[str, float]] = []
+        rects: List[Dict[str, float]] = []
 
-            tokens = []
-            for w in (target.extract_words() or []):
-                s = (w.get("text") or "").upper()
-                m = re.match(r"\bIP[-\s]?(\d{2})\b", s)
-                if m:
-                    try:
-                        tokens.append((int(m.group(1)), w))
-                    except Exception:
-                        pass
+        with pdfplumber.open(pdf_path) as pdf:  # type: ignore
+            target_page = None
+            for idx, page in enumerate(pdf.pages):
+                if is_general_spec_page(page.extract_text() or ""):
+                    target_page = page
+                    target_index = idx
+                    break
+            if target_page is None:
+                if not pdf.pages:
+                    return "IP22"
+                target_page = pdf.pages[0]
+                target_index = 0
+
+            page_width = float(getattr(target_page, "width", 0.0) or 0.0)
+            page_height = float(getattr(target_page, "height", 0.0) or 0.0)
+
+            raw_words = target_page.extract_words() or []
+            for idx, w in enumerate(raw_words):
+                text = (w.get("text") or "").strip().upper()
+                m = re.match(r"\bIP[-\s]?(\d{2})\b", text)
+                if not m and text == "IP" and idx + 1 < len(raw_words):
+                    nxt = raw_words[idx + 1]
+                    nxt_txt = (nxt.get("text") or "").strip().upper()
+                    if re.fullmatch(r"\d{2}", nxt_txt):
+                        m = re.match(r"(\d{2})", nxt_txt)
+                        if m:
+                            try:
+                                tokens.append(
+                                    (
+                                        int(m.group(1)),
+                                        {
+                                            "x0": float(min(w.get("x0", 0.0), nxt.get("x0", 0.0))),
+                                            "x1": float(max(w.get("x1", 0.0), nxt.get("x1", 0.0))),
+                                            "top": float(min(w.get("top", 0.0), nxt.get("top", 0.0))),
+                                            "bottom": float(max(w.get("bottom", 0.0), nxt.get("bottom", 0.0))),
+                                        },
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            continue
+                if not m:
+                    continue
+                try:
+                    tokens.append(
+                        (
+                            int(m.group(1)),
+                            {
+                                "x0": float(w.get("x0", 0.0)),
+                                "x1": float(w.get("x1", 0.0)),
+                                "top": float(w.get("top", 0.0)),
+                                "bottom": float(w.get("bottom", 0.0)),
+                            },
+                        )
+                    )
+                except Exception:
+                    continue
+
             if not tokens:
                 return "IP22"
 
-            chars = target.chars or []
-            rects = [r for r in (getattr(target, "rects", []) or []) if r.get("nonstroking",0) or r.get("stroking",0)]
-            rects = [r for r in rects if 1.2 <= r.get("width",0) <= 16.0 and 1.2 <= r.get("height",0) <= 16.0]
+            chars = [dict(c) for c in (target_page.chars or [])]
+            raw_rects = (getattr(target_page, "rects", []) or [])
+            for r in raw_rects:
+                if r.get("nonstroking", 0) or r.get("stroking", 0) or r.get("non_stroking_color") is not None:
+                    rects.append(dict(r))
 
-            def has_mark_near(w):
-                x0, x1 = w.get("x0", 0), w.get("x1", 0)
-                y0, y1 = w.get("top", 0), w.get("bottom", 0)
-                windows = [(x0-44, x0-2, y0-10, y1+10), (x1+2, x1+44, y0-10, y1+10)]
-                for (wx0, wx1, wy0, wy1) in windows:
-                    for c in chars:
-                        if c.get("text") in ("■","●","◼","▪","∙","•"):
-                            cx, cy = c.get("x0",0), c.get("top",0)
-                            if wx0 <= cx <= wx1 and y0-10 <= cy <= y1+10:
-                                return True
-                    for r in rects:
-                        rx, ry = r.get("x0",0), r.get("top",0)
-                        if wx0 <= rx <= wx1 and y0-10 <= ry <= y1+10:
+        def detect_with_image() -> Optional[int]:
+            if convert_from_path is None or cv2 is None or np is None:
+                return None
+            if page_width <= 0 or page_height <= 0:
+                return None
+            try:
+                images = convert_from_path(
+                    pdf_path,
+                    dpi=220,
+                    first_page=target_index + 1,
+                    last_page=target_index + 1,
+                    fmt="png",
+                )
+            except Exception:
+                return None
+            if not images:
+                return None
+            try:
+                pil_img = images[0]
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                return None
+
+            h_img, w_img = gray.shape[:2]
+            scale_x = w_img / page_width
+            scale_y = h_img / page_height
+
+            def roi_has_mark(x0: float, x1: float, y0: float, y1: float) -> bool:
+                rx0 = max(0, min(w_img, int(round(x0 * scale_x))))
+                rx1 = max(0, min(w_img, int(round(x1 * scale_x))))
+                ry0 = max(0, min(h_img, int(round(y0 * scale_y))))
+                ry1 = max(0, min(h_img, int(round(y1 * scale_y))))
+                if rx1 <= rx0 or ry1 <= ry0:
+                    return False
+                roi = gray[ry0:ry1, rx0:rx1]
+                if roi.size == 0:
+                    return False
+                try:
+                    blur = cv2.GaussianBlur(roi, (3, 3), 0)
+                    _, thresh = cv2.threshold(
+                        blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                    )
+                except Exception:
+                    return False
+
+                nz = float(cv2.countNonZero(thresh))
+                ratio = nz / float(thresh.size or 1)
+
+                # quick accept when there is heavy fill (checked box or dot)
+                if ratio >= 0.06:
+                    return True
+
+                # Inspect individual contours for partially filled squares / crosses
+                cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for cnt in cnts:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    area = max(w * h, 1)
+                    if w < 6 or h < 6 or w > 70 or h > 70:
+                        continue
+                    aspect = w / float(h)
+                    if aspect < 0.4 or aspect > 2.5:
+                        continue
+                    sub = thresh[y : y + h, x : x + w]
+                    fill = float(cv2.countNonZero(sub)) / float(area)
+                    if fill >= 0.035:
+                        # dilate thin marks to better judge "X" cases
+                        if fill < 0.06:
+                            kernel = np.ones((3, 3), np.uint8)
+                            dil = cv2.dilate(sub, kernel, iterations=1)
+                            fill = float(cv2.countNonZero(dil)) / float(area)
+                        if fill >= 0.06:
                             return True
-                return False
 
-            for val, w in tokens:
-                if has_mark_near(w):
-                    return f"IP{val:02d}"
+                # Fallback: detect strong edges (e.g., "X" marks) concentrated in the box region
+                try:
+                    edges = cv2.Canny(roi, 60, 180)
+                    edge_ratio = float(cv2.countNonZero(edges)) / float(edges.size or 1)
+                except Exception:
+                    edge_ratio = 0.0
+                return edge_ratio >= 0.09
 
-            return "IP22"
+            search_offsets = [(-110.0, -4.0), (4.0, 110.0)]
+            vertical_pad = 18.0
+            for val, box in tokens:
+                x0 = box["x0"]
+                x1 = box["x1"]
+                y0 = max(0.0, box["top"] - vertical_pad)
+                y1 = box["bottom"] + vertical_pad
+                for off0, off1 in search_offsets:
+                    wx0 = x0 + off0
+                    wx1 = x0 + off1 if off1 < 0 else x1 + off1
+                    if roi_has_mark(wx0, wx1, y0, y1):
+                        return val
+            return None
+
+        detected_value = detect_with_image()
+        if detected_value is not None:
+            return f"IP{detected_value:02d}"
+
+        def has_mark_near(box: Dict[str, float]) -> bool:
+            x0 = box.get("x0", 0.0)
+            x1 = box.get("x1", 0.0)
+            y0 = box.get("top", 0.0) - 14.0
+            y1 = box.get("bottom", 0.0) + 14.0
+            windows = [
+                (x0 - 100.0, x0 - 2.0, y0, y1),
+                (x1 + 2.0, x1 + 100.0, y0, y1),
+            ]
+            for (wx0, wx1, wy0, wy1) in windows:
+                for c in chars:
+                    if c.get("text") in ("■", "●", "◼", "▪", "∙", "•", "☑", "√"):
+                        cx = c.get("x0", 0.0)
+                        cy = c.get("top", 0.0)
+                        if wx0 <= cx <= wx1 and wy0 <= cy <= wy1:
+                            return True
+                for r in rects:
+                    rx0 = r.get("x0", 0.0)
+                    rx1 = r.get("x1", r.get("x0", 0.0))
+                    ry0 = r.get("top", 0.0)
+                    ry1 = r.get("bottom", r.get("top", 0.0))
+                    width = abs(rx1 - rx0)
+                    height = abs(ry1 - ry0)
+                    if width < 3.0 or height < 3.0 or width > 20.0 or height > 20.0:
+                        continue
+                    cx = (rx0 + rx1) / 2.0
+                    cy = (ry0 + ry1) / 2.0
+                    if wx0 <= cx <= wx1 and wy0 <= cy <= wy1:
+                        return True
+            return False
+
+        for val, box in tokens:
+            if has_mark_near(box):
+                return f"IP{val:02d}"
+
+        return "IP22"
     except Exception:
         return "IP22"
+# Ensure latest panel extractor is used by downstream code
+extract_panel_info_from_msbd = _extract_panel_info_from_acb_table
 # ---------------------------
