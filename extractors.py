@@ -1075,14 +1075,10 @@ def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:  #
         return result
 
 # ---------------------------
-# override: force IP fallback to IP22 (GENERAL SPEC page only)
+# override: checkbox detection backed by pdf2image + OpenCV (GENERAL SPEC page only)
 # This definition intentionally appears at the end of the module to override any earlier versions.
 def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[override]
-    """
-    Determine IP grade from the GENERAL SPEC page. If no checked IP can be detected,
-    ALWAYS fall back to 'IP22' as per user's requirement.
-    Accepts *args/**kwargs to remain compatible with older call sites.
-    """
+    """Determine IP grade from the GENERAL SPEC page using pdf2image + OpenCV."""
     try:
         import re
         try:
@@ -1090,56 +1086,187 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
         except Exception:
             return "IP22"
 
+        try:
+            from pdf2image import convert_from_path  # type: ignore
+            import cv2  # type: ignore
+            import numpy as np  # type: ignore
+        except Exception:
+            convert_from_path = None  # type: ignore
+            cv2 = None  # type: ignore
+            np = None  # type: ignore
+
         def is_general_spec_page(text: str) -> bool:
             t = (text or "").upper()
             return ("GENERAL" in t and "SPEC" in t)
 
-        with pdfplumber.open(pdf_path) as pdf:  # type: ignore
-            target = None
-            for p in pdf.pages:
-                if is_general_spec_page(p.extract_text() or ""):
-                    target = p
-                    break
-            if target is None:
-                return "IP22"
+        target_index = 0
+        page_width = 0.0
+        page_height = 0.0
+        tokens: List[Tuple[int, Dict[str, float]]] = []
+        chars: List[Dict[str, float]] = []
+        rects: List[Dict[str, float]] = []
 
-            tokens = []
-            for w in (target.extract_words() or []):
+        with pdfplumber.open(pdf_path) as pdf:  # type: ignore
+            target_page = None
+            for idx, page in enumerate(pdf.pages):
+                if is_general_spec_page(page.extract_text() or ""):
+                    target_page = page
+                    target_index = idx
+                    break
+            if target_page is None:
+                if not pdf.pages:
+                    return "IP22"
+                target_page = pdf.pages[0]
+                target_index = 0
+
+            page_width = float(getattr(target_page, "width", 0.0) or 0.0)
+            page_height = float(getattr(target_page, "height", 0.0) or 0.0)
+
+            for w in (target_page.extract_words() or []):
                 s = (w.get("text") or "").upper()
                 m = re.match(r"\bIP[-\s]?(\d{2})\b", s)
-                if m:
-                    try:
-                        tokens.append((int(m.group(1)), w))
-                    except Exception:
-                        pass
+                if not m:
+                    continue
+                try:
+                    tokens.append(
+                        (
+                            int(m.group(1)),
+                            {
+                                "x0": float(w.get("x0", 0.0)),
+                                "x1": float(w.get("x1", 0.0)),
+                                "top": float(w.get("top", 0.0)),
+                                "bottom": float(w.get("bottom", 0.0)),
+                            },
+                        )
+                    )
+                except Exception:
+                    continue
+
             if not tokens:
                 return "IP22"
 
-            chars = target.chars or []
-            rects = [r for r in (getattr(target, "rects", []) or []) if r.get("nonstroking",0) or r.get("stroking",0)]
-            rects = [r for r in rects if 1.2 <= r.get("width",0) <= 16.0 and 1.2 <= r.get("height",0) <= 16.0]
+            chars = [dict(c) for c in (target_page.chars or [])]
+            raw_rects = (getattr(target_page, "rects", []) or [])
+            for r in raw_rects:
+                if r.get("nonstroking", 0) or r.get("stroking", 0) or r.get("non_stroking_color") is not None:
+                    rects.append(dict(r))
 
-            def has_mark_near(w):
-                x0, x1 = w.get("x0", 0), w.get("x1", 0)
-                y0, y1 = w.get("top", 0), w.get("bottom", 0)
-                windows = [(x0-44, x0-2, y0-10, y1+10), (x1+2, x1+44, y0-10, y1+10)]
-                for (wx0, wx1, wy0, wy1) in windows:
-                    for c in chars:
-                        if c.get("text") in ("■","●","◼","▪","∙","•"):
-                            cx, cy = c.get("x0",0), c.get("top",0)
-                            if wx0 <= cx <= wx1 and y0-10 <= cy <= y1+10:
-                                return True
-                    for r in rects:
-                        rx, ry = r.get("x0",0), r.get("top",0)
-                        if wx0 <= rx <= wx1 and y0-10 <= ry <= y1+10:
-                            return True
+        def detect_with_image() -> Optional[int]:
+            if convert_from_path is None or cv2 is None or np is None:
+                return None
+            if page_width <= 0 or page_height <= 0:
+                return None
+            try:
+                images = convert_from_path(
+                    pdf_path,
+                    dpi=220,
+                    first_page=target_index + 1,
+                    last_page=target_index + 1,
+                    fmt="png",
+                )
+            except Exception:
+                return None
+            if not images:
+                return None
+            try:
+                pil_img = images[0]
+                img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception:
+                return None
+
+            h_img, w_img = gray.shape[:2]
+            scale_x = w_img / page_width
+            scale_y = h_img / page_height
+
+            def roi_has_mark(x0: float, x1: float, y0: float, y1: float) -> bool:
+                rx0 = max(0, min(w_img, int(round(x0 * scale_x))))
+                rx1 = max(0, min(w_img, int(round(x1 * scale_x))))
+                ry0 = max(0, min(h_img, int(round(y0 * scale_y))))
+                ry1 = max(0, min(h_img, int(round(y1 * scale_y))))
+                if rx1 <= rx0 or ry1 <= ry0:
+                    return False
+                roi = gray[ry0:ry1, rx0:rx1]
+                if roi.size == 0:
+                    return False
+                try:
+                    blur = cv2.GaussianBlur(roi, (3, 3), 0)
+                    _, thresh = cv2.threshold(
+                        blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                    )
+                except Exception:
+                    return False
+                ratio = float(cv2.countNonZero(thresh)) / float(thresh.size or 1)
+                if ratio < 0.03:
+                    return False
+                cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                for cnt in cnts:
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    area = w * h
+                    if area < 36:
+                        continue
+                    if w < 3 or h < 3:
+                        continue
+                    sub = thresh[y : y + h, x : x + w]
+                    fill = float(cv2.countNonZero(sub)) / float(area or 1)
+                    if fill > 0.2:
+                        return True
                 return False
 
-            for val, w in tokens:
-                if has_mark_near(w):
-                    return f"IP{val:02d}"
+            for val, box in tokens:
+                x0 = box["x0"]
+                x1 = box["x1"]
+                y0 = max(0.0, box["top"] - 12.0)
+                y1 = box["bottom"] + 12.0
+                windows = [
+                    (x0 - 48.0, x0 - 6.0, y0, y1),
+                    (x1 + 6.0, x1 + 48.0, y0, y1),
+                ]
+                for wx0, wx1, wy0, wy1 in windows:
+                    if roi_has_mark(wx0, wx1, wy0, wy1):
+                        return val
+            return None
 
-            return "IP22"
+        detected_value = detect_with_image()
+        if detected_value is not None:
+            return f"IP{detected_value:02d}"
+
+        def has_mark_near(box: Dict[str, float]) -> bool:
+            x0 = box.get("x0", 0.0)
+            x1 = box.get("x1", 0.0)
+            y0 = box.get("top", 0.0) - 10.0
+            y1 = box.get("bottom", 0.0) + 10.0
+            windows = [
+                (x0 - 44.0, x0 - 2.0, y0, y1),
+                (x1 + 2.0, x1 + 44.0, y0, y1),
+            ]
+            for (wx0, wx1, wy0, wy1) in windows:
+                for c in chars:
+                    if c.get("text") in ("■", "●", "◼", "▪", "∙", "•"):
+                        cx = c.get("x0", 0.0)
+                        cy = c.get("top", 0.0)
+                        if wx0 <= cx <= wx1 and y0 <= cy <= y1:
+                            return True
+                for r in rects:
+                    rx0 = r.get("x0", 0.0)
+                    rx1 = r.get("x1", r.get("x0", 0.0))
+                    ry0 = r.get("top", 0.0)
+                    ry1 = r.get("bottom", r.get("top", 0.0))
+                    width = abs(rx1 - rx0)
+                    height = abs(ry1 - ry0)
+                    if width < 1.2 or height < 1.2 or width > 16.0 or height > 16.0:
+                        continue
+                    cx = (rx0 + rx1) / 2.0
+                    cy = (ry0 + ry1) / 2.0
+                    if wx0 <= cx <= wx1 and y0 <= cy <= y1:
+                        return True
+            return False
+
+        for val, box in tokens:
+            if has_mark_near(box):
+                return f"IP{val:02d}"
+
+        return "IP22"
     except Exception:
         return "IP22"
 # ---------------------------
