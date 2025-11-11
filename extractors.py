@@ -1122,9 +1122,31 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
             page_width = float(getattr(target_page, "width", 0.0) or 0.0)
             page_height = float(getattr(target_page, "height", 0.0) or 0.0)
 
-            for w in (target_page.extract_words() or []):
-                s = (w.get("text") or "").upper()
-                m = re.match(r"\bIP[-\s]?(\d{2})\b", s)
+            raw_words = target_page.extract_words() or []
+            for idx, w in enumerate(raw_words):
+                text = (w.get("text") or "").strip().upper()
+                m = re.match(r"\bIP[-\s]?(\d{2})\b", text)
+                if not m and text == "IP" and idx + 1 < len(raw_words):
+                    nxt = raw_words[idx + 1]
+                    nxt_txt = (nxt.get("text") or "").strip().upper()
+                    if re.fullmatch(r"\d{2}", nxt_txt):
+                        m = re.match(r"(\d{2})", nxt_txt)
+                        if m:
+                            try:
+                                tokens.append(
+                                    (
+                                        int(m.group(1)),
+                                        {
+                                            "x0": float(min(w.get("x0", 0.0), nxt.get("x0", 0.0))),
+                                            "x1": float(max(w.get("x1", 0.0), nxt.get("x1", 0.0))),
+                                            "top": float(min(w.get("top", 0.0), nxt.get("top", 0.0))),
+                                            "bottom": float(max(w.get("bottom", 0.0), nxt.get("bottom", 0.0))),
+                                        },
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            continue
                 if not m:
                     continue
                 try:
@@ -1196,34 +1218,54 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
                     )
                 except Exception:
                     return False
-                ratio = float(cv2.countNonZero(thresh)) / float(thresh.size or 1)
-                if ratio < 0.03:
-                    return False
+
+                nz = float(cv2.countNonZero(thresh))
+                ratio = nz / float(thresh.size or 1)
+
+                # quick accept when there is heavy fill (checked box or dot)
+                if ratio >= 0.06:
+                    return True
+
+                # Inspect individual contours for partially filled squares / crosses
                 cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for cnt in cnts:
                     x, y, w, h = cv2.boundingRect(cnt)
-                    area = w * h
-                    if area < 36:
+                    area = max(w * h, 1)
+                    if w < 6 or h < 6 or w > 70 or h > 70:
                         continue
-                    if w < 3 or h < 3:
+                    aspect = w / float(h)
+                    if aspect < 0.4 or aspect > 2.5:
                         continue
                     sub = thresh[y : y + h, x : x + w]
-                    fill = float(cv2.countNonZero(sub)) / float(area or 1)
-                    if fill > 0.2:
-                        return True
-                return False
+                    fill = float(cv2.countNonZero(sub)) / float(area)
+                    if fill >= 0.035:
+                        # dilate thin marks to better judge "X" cases
+                        if fill < 0.06:
+                            kernel = np.ones((3, 3), np.uint8)
+                            dil = cv2.dilate(sub, kernel, iterations=1)
+                            fill = float(cv2.countNonZero(dil)) / float(area)
+                        if fill >= 0.06:
+                            return True
 
+                # Fallback: detect strong edges (e.g., "X" marks) concentrated in the box region
+                try:
+                    edges = cv2.Canny(roi, 60, 180)
+                    edge_ratio = float(cv2.countNonZero(edges)) / float(edges.size or 1)
+                except Exception:
+                    edge_ratio = 0.0
+                return edge_ratio >= 0.09
+
+            search_offsets = [(-110.0, -4.0), (4.0, 110.0)]
+            vertical_pad = 18.0
             for val, box in tokens:
                 x0 = box["x0"]
                 x1 = box["x1"]
-                y0 = max(0.0, box["top"] - 12.0)
-                y1 = box["bottom"] + 12.0
-                windows = [
-                    (x0 - 48.0, x0 - 6.0, y0, y1),
-                    (x1 + 6.0, x1 + 48.0, y0, y1),
-                ]
-                for wx0, wx1, wy0, wy1 in windows:
-                    if roi_has_mark(wx0, wx1, wy0, wy1):
+                y0 = max(0.0, box["top"] - vertical_pad)
+                y1 = box["bottom"] + vertical_pad
+                for off0, off1 in search_offsets:
+                    wx0 = x0 + off0
+                    wx1 = x0 + off1 if off1 < 0 else x1 + off1
+                    if roi_has_mark(wx0, wx1, y0, y1):
                         return val
             return None
 
@@ -1234,18 +1276,18 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
         def has_mark_near(box: Dict[str, float]) -> bool:
             x0 = box.get("x0", 0.0)
             x1 = box.get("x1", 0.0)
-            y0 = box.get("top", 0.0) - 10.0
-            y1 = box.get("bottom", 0.0) + 10.0
+            y0 = box.get("top", 0.0) - 14.0
+            y1 = box.get("bottom", 0.0) + 14.0
             windows = [
-                (x0 - 44.0, x0 - 2.0, y0, y1),
-                (x1 + 2.0, x1 + 44.0, y0, y1),
+                (x0 - 100.0, x0 - 2.0, y0, y1),
+                (x1 + 2.0, x1 + 100.0, y0, y1),
             ]
             for (wx0, wx1, wy0, wy1) in windows:
                 for c in chars:
-                    if c.get("text") in ("■", "●", "◼", "▪", "∙", "•"):
+                    if c.get("text") in ("■", "●", "◼", "▪", "∙", "•", "☑", "√"):
                         cx = c.get("x0", 0.0)
                         cy = c.get("top", 0.0)
-                        if wx0 <= cx <= wx1 and y0 <= cy <= y1:
+                        if wx0 <= cx <= wx1 and wy0 <= cy <= wy1:
                             return True
                 for r in rects:
                     rx0 = r.get("x0", 0.0)
@@ -1254,11 +1296,11 @@ def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[ove
                     ry1 = r.get("bottom", r.get("top", 0.0))
                     width = abs(rx1 - rx0)
                     height = abs(ry1 - ry0)
-                    if width < 1.2 or height < 1.2 or width > 16.0 or height > 16.0:
+                    if width < 3.0 or height < 3.0 or width > 20.0 or height > 20.0:
                         continue
                     cx = (rx0 + rx1) / 2.0
                     cy = (ry0 + ry1) / 2.0
-                    if wx0 <= cx <= wx1 and y0 <= cy <= y1:
+                    if wx0 <= cx <= wx1 and wy0 <= cy <= wy1:
                         return True
             return False
 
