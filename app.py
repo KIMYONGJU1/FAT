@@ -10,10 +10,14 @@ from __future__ import annotations
 APP_NAME = "FAT AutoFill Pro (v2.4.2_fix13c)"
 
 import os
-import re, re, datetime, threading, traceback
+import re
+import datetime
+import threading
+import traceback
 from typing import Dict, Optional, List, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 # lazy import to prevent startup crash if docxtpl is missing
 def DocxTemplate(*args, **kwargs):
     try:
@@ -72,15 +76,61 @@ class App(tk.Tk):
 
     def log(self, msg: str):
         try:
-            self.after(0, lambda: (self.txt.insert("end", msg + "\n"), self.txt.see("end")))
+            self.after(0, lambda: self._append_log(msg))
+        except Exception:
+            pass
+
+    def _append_log(self, msg: str):
+        try:
+            self.txt.insert("end", msg + "\n")
+            self.txt.see("end")
+            self._set_status(msg)
+        except Exception:
+            pass
+
+    def _set_status(self, text: str):
+        try:
+            short = (text or "").strip()
+            if len(short) > 70:
+                short = short[:67] + "..."
+            self.status_var.set(short or "준비 완료")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _color_to_hex(name: str) -> str:
+        base = (name or "").upper()
+        palette = {
+            "RED": "#d9534f",
+            "PINK": "#f497b5",
+            "BROWN": "#8d6e63",
+            "BLUE": "#5bc0de",
+            "LIGHT BLUE": "#8fd3f4",
+            "GREEN": "#5cb85c",
+            "LIGHT GREEN": "#9ad89a",
+            "YELLOW": "#f0ad4e",
+            "GOLD": "#c9b037",
+            "SILVER": "#bfbfbf",
+            "PURPLE": "#b39ddb",
+        }
+        for key, val in palette.items():
+            if key in base:
+                return val
+        return "#d9d9d9"
+
+    def _update_color_chip(self, color_text: str):
+        try:
+            hex_color = self._color_to_hex(color_text)
+            self.em_color_chip.configure(bg=hex_color)
         except Exception:
             pass
 
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x740")
+        self.geometry("1120x780")
         self.resizable(True, True)
+        self._init_style()
 
         self.template_path = tk.StringVar()
         self.msbd_path = tk.StringVar()
@@ -91,6 +141,10 @@ class App(tk.Tk):
         self.hull_to_class: Dict[str,str] = {}
         self.selected_hull = tk.StringVar()
 
+        self.status_var = tk.StringVar(value="준비 완료")
+
+        self.em_color = tk.StringVar()
+
         self._build_ui()
         try:
             self._panel_refresh_list()
@@ -98,215 +152,258 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    
+
+    def _init_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("Card.TLabelframe", padding=(12, 10))
+        style.configure("Card.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
+        style.configure("Status.TLabel", foreground="#3a3a3a")
+
+
     def progress(self, pct:int, stage:str=None):
-            try:
-                if stage:
-                    self.title(f"{APP_NAME} - {stage} {pct}%")
-                self.pbar["value"] = max(0, min(100, int(pct)))
-            except Exception:
-                pass
+        try:
+            if stage:
+                display = f"{stage} {pct}%" if pct is not None else stage
+                self.title(f"{APP_NAME} - {display}")
+                self._set_status(display)
+            self.pbar["value"] = max(0, min(100, int(pct)))
+        except Exception:
+            pass
 
     
     def _build_ui(self):
 
-        pad = {"padx":8,"pady":6}
+        container = ttk.Frame(self, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=5)
+        container.rowconfigure(4, weight=2)
 
-        frm = ttk.LabelFrame(self, text="파일 선택")
-        frm.pack(fill="x", **pad)
+        files = ttk.LabelFrame(container, text="파일 선택", style="Card.TLabelframe")
+        files.grid(row=0, column=0, sticky="ew")
 
-        ttk.Label(frm, text="템플릿 DOCX").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.template_path, width=90).grid(row=0, column=1, sticky="ew")
-        ttk.Button(frm, text="찾기...", command=self._pick_template).grid(row=0, column=2, sticky="e")
+        pickers = [
+            ("템플릿 DOCX", self.template_path, self._pick_template, "찾기..."),
+            ("MSBD PDF", self.msbd_path, self._pick_msbd, "찾기..."),
+            ("GSP PDF", self.gsp_path, self._pick_gsp, "찾기..."),
+            ("저장 폴더", self.save_dir, self._pick_dir, "폴더 선택"),
+        ]
+        for row, (label, var, cmd, btn_text) in enumerate(pickers):
+            ttk.Label(files, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=4)
+            entry = ttk.Entry(files, textvariable=var)
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            ttk.Button(files, text=btn_text, width=12, command=cmd).grid(row=row, column=2, sticky="e", pady=4)
+        files.columnconfigure(1, weight=1)
 
-        ttk.Label(frm, text="MSBD PDF").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.msbd_path, width=90).grid(row=1, column=1, sticky="ew")
-        ttk.Button(frm, text="찾기...", command=self._pick_msbd).grid(row=1, column=2, sticky="e")
-
-        ttk.Label(frm, text="GSP PDF").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.gsp_path, width=90).grid(row=2, column=1, sticky="ew")
-        ttk.Button(frm, text="찾기...", command=self._pick_gsp).grid(row=2, column=2, sticky="e")
-
-        ttk.Label(frm, text="저장 폴더").grid(row=3, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.save_dir, width=90).grid(row=3, column=1, sticky="ew")
-        ttk.Button(frm, text="변경...", command=self._pick_dir).grid(row=3, column=2, sticky="e")
-
-        for i in range(3):
-            frm.columnconfigure(i, weight=1)
-
-        
         self.panels_data = []
         self.em_stops_data = []
 
-        act = ttk.Frame(self)
-        act.pack(fill="x", **pad)
-        ttk.Button(act, text="1) 추출", command=lambda: self._start_task(self._extract_worker)).pack(side="left", padx=4)
-        ttk.Button(act, text="2) 보고서 생성", command=lambda: self._start_task(self._generate_worker)).pack(side="left", padx=4)
-        ttk.Button(act, text="템플릿 진단", command=lambda: self._start_task(self._validate_template_worker)).pack(side="left", padx=4)
-        self.pbar = ttk.Progressbar(act, mode="determinate", maximum=100, length=220)
-        self.pbar.pack(side="right", padx=6)
+        actions = ttk.Frame(container)
+        actions.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        actions.columnconfigure(0, weight=1)
 
-        sel = ttk.LabelFrame(self, text="호선 선택 & 선급 자동 반영")
-        sel.pack(fill="x", **pad)
+        buttons = ttk.Frame(actions)
+        buttons.grid(row=0, column=0, sticky="w")
+        ttk.Button(buttons, text="1) 추출", command=lambda: self._start_task(self._extract_worker)).pack(side="left", padx=4)
+        ttk.Button(buttons, text="2) 보고서 생성", command=lambda: self._start_task(self._generate_worker)).pack(side="left", padx=4)
+        ttk.Button(buttons, text="템플릿 진단", command=lambda: self._start_task(self._validate_template_worker)).pack(side="left", padx=4)
 
-        ttk.Label(sel, text="Hull No").grid(row=0, column=0, sticky="w")
+        status_box = ttk.Frame(actions)
+        status_box.grid(row=0, column=1, sticky="e")
+        self.pbar = ttk.Progressbar(status_box, mode="determinate", maximum=100, length=240)
+        self.pbar.pack(fill="x", padx=4)
+        ttk.Label(status_box, textvariable=self.status_var, style="Status.TLabel").pack(anchor="e", pady=(4, 0))
+
+        sel = ttk.LabelFrame(container, text="호선 선택 & 선급 자동 반영", style="Card.TLabelframe")
+        sel.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(sel, text="Hull No").grid(row=0, column=0, sticky="w", padx=(0, 6), pady=4)
         self.cmb_hull = ttk.Combobox(sel, textvariable=self.selected_hull, values=self.hull_options, state="readonly", width=20)
-        self.cmb_hull.grid(row=0, column=1, sticky="w", padx=6)
+        self.cmb_hull.grid(row=0, column=1, sticky="w", pady=4)
         self.cmb_hull.bind("<<ComboboxSelected>>", self._on_hull_change)
-
-        ttk.Label(sel, text="Class (자동)").grid(row=0, column=2, sticky="w")
+        ttk.Label(sel, text="Class (자동)").grid(row=0, column=2, sticky="w", padx=(20, 6), pady=4)
         self.class_var = tk.StringVar()
-        self.ent_class = ttk.Entry(sel, width=20, textvariable=self.class_var, state="disabled")
-        self.ent_class.grid(row=0, column=3, sticky="w")
+        self.ent_class = ttk.Entry(sel, textvariable=self.class_var, width=24, state="disabled")
+        self.ent_class.grid(row=0, column=3, sticky="ew", pady=4)
+        sel.columnconfigure(1, weight=1)
+        sel.columnconfigure(3, weight=1)
 
-        for i in range(4):
-            sel.columnconfigure(i, weight=1)
+        grid = ttk.LabelFrame(container, text="추출된 값 (수정 가능)", style="Card.TLabelframe")
+        grid.grid(row=3, column=0, sticky="nsew", pady=(12, 0))
+        grid.columnconfigure(0, weight=1)
+        grid.rowconfigure(0, weight=1)
 
-        
-        grid = ttk.LabelFrame(self, text="추출된 값 (수정 가능)")
-        grid.pack(fill="both", expand=True, **pad)
-
-        # --- Tabs (always visible) ---
         self.values_nb = ttk.Notebook(grid)
-        self.page_spec   = ttk.Frame(self.values_nb)
-        self.page_panel  = ttk.Frame(self.values_nb)
-        self.page_estop  = ttk.Frame(self.values_nb)
-        self.values_nb.add(self.page_spec,  text="① 표지 / GENERAL SPEC")
+        self.page_spec = ttk.Frame(self.values_nb)
+        self.page_panel = ttk.Frame(self.values_nb)
+        self.page_estop = ttk.Frame(self.values_nb)
+        self.values_nb.add(self.page_spec, text="① 표지 / GENERAL SPEC")
         self.values_nb.add(self.page_panel, text="② PANEL INFORMATION")
-        self.values_nb.add(self.page_estop, text="③ EMERGENCY STOP INFORMATION")
-        self.values_nb.pack(fill="both", expand=True)
+        self.values_nb.add(self.page_estop, text="③ EMERGENCY STOP PANEL")
+        self.values_nb.grid(row=0, column=0, sticky="nsew")
 
-        # --- Page 1: Spec key-value form ---
         self.entries: Dict[str, tk.Entry] = {}
         ui_fields = [k for k in FIELDS if k != 'class']
         left_fields = ui_fields[:len(ui_fields)//2]
         right_fields = ui_fields[len(ui_fields)//2:]
 
-        def add_col(parent, col_fields, col_index):
-            for r, key in enumerate(col_fields):
-                ttk.Label(parent, text=key).grid(row=r, column=col_index*2, sticky="w", padx=4, pady=2)
-                e = ttk.Entry(parent)
-                e.grid(row=r, column=col_index*2+1, sticky="ew", padx=4, pady=2)
-                self.entries[key] = e
+        spec_wrap = ttk.Frame(self.page_spec, padding=16)
+        spec_wrap.pack(fill="both", expand=True)
+        spec_wrap.columnconfigure(0, weight=1)
+        spec_wrap.columnconfigure(1, weight=1)
 
-        add_col(self.page_spec, left_fields, 0)
-        add_col(self.page_spec, right_fields, 1)
-        for c in range(4):
-            self.page_spec.columnconfigure(c, weight=1)
+        def build_column(parent, col_index, fields):
+            frame = ttk.Frame(parent)
+            frame.grid(row=0, column=col_index, sticky="nsew", padx=8)
+            frame.columnconfigure(1, weight=1)
+            for r, key in enumerate(fields):
+                ttk.Label(frame, text=key).grid(row=r, column=0, sticky="w", pady=3)
+                entry = ttk.Entry(frame)
+                entry.grid(row=r, column=1, sticky="ew", pady=3)
+                self.entries[key] = entry
 
-        # --- Page 2: Panels editor (inline) ---
-        tp = self.page_panel
-        left = ttk.Frame(tp); left.pack(side="left", fill="y")
-        right = ttk.Frame(tp); right.pack(side="right", fill="both", expand=True)
+        build_column(spec_wrap, 0, left_fields)
+        build_column(spec_wrap, 1, right_fields)
 
-        self.lst_panels = tk.Listbox(left, height=12)
-        self.lst_panels.pack(side="left", fill="y")
-        self.lst_panels.bind("<<ListboxSelect>>", lambda e: self._panel_select())
-        ttk.Button(left, text="새로고침", command=self._panel_refresh_list).pack(side="left", padx=4)
+        panel_wrap = ttk.Frame(self.page_panel, padding=12)
+        panel_wrap.pack(fill="both", expand=True)
+        paned = ttk.PanedWindow(panel_wrap, orient="horizontal")
+        paned.pack(fill="both", expand=True)
 
-        pgrid = ttk.Frame(right); pgrid.pack(fill="both", expand=True, padx=8, pady=8)
-        labels = ['panel','acb_type','ocr_type','ampere_frame','rated_current_in','ir_percent','ir_amps','isd_percent','isd_amps','remarks']
-        self.panel_vars = {k: tk.StringVar() for k in labels}
-        for r,k in enumerate(labels):
-            ttk.Label(pgrid, text=k).grid(row=r, column=0, sticky="w")
-            ttk.Entry(pgrid, textvariable=self.panel_vars[k]).grid(row=r, column=1, sticky="ew")
-        pgrid.columnconfigure(1, weight=1)
+        left_panel = ttk.Frame(paned)
+        paned.add(left_panel, weight=1)
+        right_panel = ttk.Frame(paned)
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(0, weight=1)
+        paned.add(right_panel, weight=2)
 
-        ttk.Label(pgrid, text="Circuits").grid(row=len(labels), column=0, sticky="nw")
-        self.txt_panel_circuits = tk.Text(pgrid, height=10, wrap="none")
-        self.txt_panel_circuits.grid(row=len(labels), column=1, sticky="nsew")
-        sc = ttk.Scrollbar(pgrid, orient="vertical", command=self.txt_panel_circuits.yview)
-        self.txt_panel_circuits.configure(yscrollcommand=sc.set)
-        sc.grid(row=len(labels), column=2, sticky="ns")
-        pgrid.rowconfigure(len(labels), weight=1)
+        tree_frame = ttk.Frame(left_panel)
+        tree_frame.pack(fill="both", expand=True)
+        columns = ("panel", "acb", "ocr", "in")
+        self.panel_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse", height=12)
+        headings = {
+            "panel": "Panel",
+            "acb": "ACB Type",
+            "ocr": "OCR Type",
+            "in": "Rated In (A)",
+        }
+        for key, text in headings.items():
+            self.panel_tree.heading(key, text=text)
+            anchor = "e" if key == "in" else "w"
+            width = 140 if key == "panel" else 120
+            self.panel_tree.column(key, anchor=anchor, width=width, stretch=True)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.panel_tree.yview)
+        self.panel_tree.configure(yscrollcommand=vsb.set)
+        self.panel_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.panel_tree.bind("<<TreeviewSelect>>", lambda e: self._panel_select())
 
-        pbtns = ttk.Frame(right); pbtns.pack(fill="x")
-        ttk.Button(pbtns, text="적용(현 패널)", command=self._panel_apply).pack(side="left")
+        ttk.Button(left_panel, text="새로고침", command=self._panel_refresh_list).pack(fill="x", pady=(6, 0))
 
-        # --- Page 3: Emergency editor (inline) ---
-        te = self.page_estop
-        left2 = ttk.Frame(te); left2.pack(side="left", fill="y")
-        right2 = ttk.Frame(te); right2.pack(side="right", fill="both", expand=True)
+        right_split = ttk.Frame(right_panel)
+        right_split.grid(row=0, column=0, sticky="nsew")
+        right_split.columnconfigure(0, weight=1)
+        right_split.columnconfigure(1, weight=1)
+        right_split.rowconfigure(0, weight=1)
 
-        self.lst_em_codes = tk.Listbox(left2, height=12)
-        self.lst_em_codes.pack(side="left", fill="y")
-        self.lst_em_codes.bind("<<ListboxSelect>>", lambda e: self._em_select())
-        ttk.Button(left2, text="새로고침", command=self._em_refresh_list).pack(side="left", padx=4)
+        info_frame = ttk.LabelFrame(right_split, text="① 패널 기본 정보", padding=12)
+        info_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        panel_fields = [
+            'panel','acb_type','ocr_type','ampere_frame','rated_current_in','ip','paint',
+            'ir_percent','ir_amps','isd_percent','isd_amps','setting_time_s','setting_time_ms','remarks'
+        ]
+        self.panel_vars = {k: tk.StringVar() for k in panel_fields}
+        info_frame.columnconfigure(1, weight=1)
+        for r, key in enumerate(panel_fields):
+            ttk.Label(info_frame, text=key).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Entry(info_frame, textvariable=self.panel_vars[key]).grid(row=r, column=1, sticky="ew", pady=2)
 
-        eform = ttk.Frame(right2); eform.pack(fill="x", padx=8, pady=8)
-        self.em_code = tk.StringVar(); self.em_name = tk.StringVar()
-        ttk.Label(eform, text="CODE").grid(row=0, column=0, sticky="w")
-        ttk.Entry(eform, textvariable=self.em_code, width=20).grid(row=0, column=1, sticky="ew")
-        ttk.Label(eform, text="NAME").grid(row=1, column=0, sticky="w")
-        ttk.Entry(eform, textvariable=self.em_name, width=50).grid(row=1, column=1, sticky="ew")
-        eform.columnconfigure(1, weight=1)
+        circuits_frame = ttk.LabelFrame(right_split, text="② Circuit No.", padding=12)
+        circuits_frame.grid(row=0, column=1, sticky="nsew")
+        circuits_frame.columnconfigure(0, weight=1)
+        circuits_frame.rowconfigure(0, weight=1)
 
-        ttk.Label(right2, text="회로 그룹(한 블록 = 한 패널)\n예: [No.1 INCOMING]\nP31-001-01-PN, P31-002-01-PN").pack(anchor="w", padx=8)
-        self.txt_em_circuits = tk.Text(right2, height=12, wrap="word")
-        self.txt_em_circuits.pack(fill="both", expand=True, padx=8, pady=4)
-        ttk.Button(right2, text="적용(현 항목)", command=self._em_apply).pack(anchor="w", padx=8, pady=6)
+        self.txt_panel_circuits = tk.Text(circuits_frame, wrap="none")
+        self.txt_panel_circuits.grid(row=0, column=0, sticky="nsew")
+        circuit_vsb = ttk.Scrollbar(circuits_frame, orient="vertical", command=self.txt_panel_circuits.yview)
+        circuit_vsb.grid(row=0, column=1, sticky="ns")
+        circuit_hsb = ttk.Scrollbar(circuits_frame, orient="horizontal", command=self.txt_panel_circuits.xview)
+        circuit_hsb.grid(row=1, column=0, sticky="ew")
+        self.txt_panel_circuits.configure(yscrollcommand=circuit_vsb.set, xscrollcommand=circuit_hsb.set)
 
-        self.txt = tk.Text(self, height=8)
-        self.txt.pack(fill="both", expand=False, **pad)
+        ttk.Button(right_panel, text="적용(현 패널)", command=self._panel_apply).grid(row=1, column=0, sticky="e", pady=(8, 0))
 
+        estop_wrap = ttk.Frame(self.page_estop, padding=12)
+        estop_wrap.pack(fill="both", expand=True)
+        estop_paned = ttk.PanedWindow(estop_wrap, orient="horizontal")
+        estop_paned.pack(fill="both", expand=True)
 
-    def _open_panels_editor(self):
-        win = tk.Toplevel(self)
-        win.title("Panels / Emergency")
-        nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True)
+        left_estop = ttk.Frame(estop_paned)
+        estop_paned.add(left_estop, weight=1)
+        right_estop = ttk.Frame(estop_paned)
+        estop_paned.add(right_estop, weight=2)
 
-        # Panels tab
-        tp = ttk.Frame(nb); nb.add(tp, text="Panels")
-        left = ttk.Frame(tp); left.pack(side="left", fill="y")
-        right = ttk.Frame(tp); right.pack(side="right", fill="both", expand=True)
+        list_frame = ttk.Frame(left_estop)
+        list_frame.pack(fill="both", expand=True)
+        em_columns = ("code", "color", "name")
+        self.em_tree = ttk.Treeview(list_frame, columns=em_columns, show="headings", selectmode="browse")
+        self.em_tree.grid(row=0, column=0, sticky="nsew")
+        self.em_tree.heading("code", text="CODE")
+        self.em_tree.heading("color", text="COLOR")
+        self.em_tree.heading("name", text="NAME")
+        self.em_tree.column("code", width=90, anchor="w")
+        self.em_tree.column("color", width=100, anchor="w")
+        self.em_tree.column("name", width=220, anchor="w")
+        em_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.em_tree.yview)
+        self.em_tree.configure(yscrollcommand=em_scroll.set)
+        em_scroll.grid(row=0, column=1, sticky="ns")
+        self.em_tree.bind("<<TreeviewSelect>>", lambda e: self._em_select())
+        list_frame.columnconfigure(0, weight=1)
+        list_frame.rowconfigure(0, weight=1)
+        ttk.Button(left_estop, text="새로고침", command=self._em_refresh_list).pack(fill="x", pady=(6, 0))
 
-        self.lst_panels = tk.Listbox(left, height=12)
-        self.lst_panels.pack(side="left", fill="y")
-        self.lst_panels.bind("<<ListboxSelect>>", lambda e: self._panel_select())
+        info_estop = ttk.LabelFrame(right_estop, text="비상정지 기본 정보", padding=12)
+        info_estop.pack(fill="x")
+        self.em_code = tk.StringVar()
+        self.em_name = tk.StringVar()
+        info_estop.columnconfigure(1, weight=1)
+        ttk.Label(info_estop, text="CODE").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(info_estop, textvariable=self.em_code, width=20).grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(info_estop, text="COLOR").grid(row=1, column=0, sticky="w", pady=2)
+        color_holder = ttk.Frame(info_estop)
+        color_holder.grid(row=1, column=1, sticky="ew", pady=2)
+        color_holder.columnconfigure(0, weight=1)
+        ttk.Entry(color_holder, textvariable=self.em_color).grid(row=0, column=0, sticky="ew")
+        self.em_color_chip = tk.Label(color_holder, width=10, relief="groove", borderwidth=1)
+        self.em_color_chip.grid(row=0, column=1, padx=(6,0))
+        ttk.Label(info_estop, text="NAME").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(info_estop, textvariable=self.em_name, width=40).grid(row=2, column=1, sticky="ew", pady=2)
 
-        ttk.Button(left, text="새로고침", command=self._panel_refresh_list).pack(side="left", padx=4)
+        groups_frame = ttk.LabelFrame(right_estop, text="회로 그룹 (CODE별 패널)", padding=12)
+        groups_frame.pack(fill="both", expand=True, pady=(10, 0))
+        groups_frame.columnconfigure(0, weight=1)
+        groups_frame.rowconfigure(0, weight=1)
+        ttk.Label(groups_frame, text="예: ES-1A [No.1 AC440V FEEDER PANEL]\nP31-001-01-PN, P31-002-01-PN", justify="left").grid(row=0, column=0, sticky="w", pady=(0,6))
+        self.txt_em_circuits = tk.Text(groups_frame, wrap="word")
+        self.txt_em_circuits.grid(row=1, column=0, sticky="nsew")
+        em_vsb = ttk.Scrollbar(groups_frame, orient="vertical", command=self.txt_em_circuits.yview)
+        em_vsb.grid(row=1, column=1, sticky="ns")
+        em_hsb = ttk.Scrollbar(groups_frame, orient="horizontal", command=self.txt_em_circuits.xview)
+        em_hsb.grid(row=2, column=0, sticky="ew")
+        self.txt_em_circuits.configure(yscrollcommand=em_vsb.set, xscrollcommand=em_hsb.set)
+        ttk.Button(right_estop, text="적용(현 항목)", command=self._em_apply).pack(anchor="e", pady=(8, 0))
 
-        grid = ttk.Frame(right); grid.pack(fill="both", expand=True, padx=8, pady=8)
-        labels = ['panel','acb_type','ocr_type','ampere_frame','rated_current_in','ir_percent','ir_amps','isd_percent','isd_amps','remarks']
-        self.panel_vars = {k: tk.StringVar() for k in labels}
-        for r,k in enumerate(labels):
-            ttk.Label(grid, text=k).grid(row=r, column=0, sticky="w")
-            ttk.Entry(grid, textvariable=self.panel_vars[k]).grid(row=r, column=1, sticky="ew")
-        grid.columnconfigure(1, weight=1)
-
-        ttk.Label(grid, text="Circuits").grid(row=len(labels), column=0, sticky="nw")
-        self.txt_panel_circuits = tk.Text(grid, height=10, wrap="none")
-        self.txt_panel_circuits.grid(row=len(labels), column=1, sticky="nsew")
-        sc = ttk.Scrollbar(grid, orient="vertical", command=self.txt_panel_circuits.yview)
-        self.txt_panel_circuits.configure(yscrollcommand=sc.set)
-        sc.grid(row=len(labels), column=2, sticky="ns")
-        grid.rowconfigure(len(labels), weight=1)
-
-        btns = ttk.Frame(right); btns.pack(fill="x")
-        ttk.Button(btns, text="적용(현 패널)", command=self._panel_apply).pack(side="left")
-
-        # Emergency tab
-        te = ttk.Frame(nb); nb.add(te, text="Emergency")
-        left2 = ttk.Frame(te); left2.pack(side="left", fill="y")
-        right2 = ttk.Frame(te); right2.pack(side="right", fill="both", expand=True)
-        self.lst_em_codes = tk.Listbox(left2, height=12)
-        self.lst_em_codes.pack(side="left", fill="y")
-        self.lst_em_codes.bind("<<ListboxSelect>>", lambda e: self._em_select())
-        ttk.Button(left2, text="새로고침", command=self._em_refresh_list).pack(side="left", padx=4)
-
-        form = ttk.Frame(right2); form.pack(fill="x", padx=8, pady=8)
-        self.em_code = tk.StringVar(); self.em_name = tk.StringVar()
-        ttk.Label(form, text="CODE").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.em_code, width=20).grid(row=0, column=1, sticky="ew")
-        ttk.Label(form, text="NAME").grid(row=1, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.em_name, width=50).grid(row=1, column=1, sticky="ew")
-        form.columnconfigure(1, weight=1)
-
-        ttk.Label(right2, text="회로 그룹(한 블록 = 한 패널)\n예: [No.1 INCOMING]\nP31-001-01-PN, P31-002-01-PN").pack(anchor="w", padx=8)
-        self.txt_em_circuits = tk.Text(right2, height=12, wrap="word")
-        self.txt_em_circuits.pack(fill="both", expand=True, padx=8, pady=4)
-        ttk.Button(right2, text="적용(현 항목)", command=self._em_apply).pack(anchor="w", padx=8, pady=6)
+        log_frame = ttk.LabelFrame(container, text="로그", style="Card.TLabelframe")
+        log_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        self.txt = ScrolledText(log_frame, height=8, wrap="word")
+        self.txt.grid(row=0, column=0, sticky="nsew")
 
 
     # ---------- pickers ----------
@@ -506,72 +603,174 @@ class App(tk.Tk):
 
 
     def _panel_refresh_list(self):
-        self.lst_panels.delete(0, "end")
-        for p in self.panels_data:
-            self.lst_panels.insert("end", p.get("panel","(panel)"))
+        if not hasattr(self, "panel_tree"):
+            return
+        for item in self.panel_tree.get_children():
+            self.panel_tree.delete(item)
+        for idx, panel in enumerate(self.panels_data):
+            values = (
+                panel.get("panel", ""),
+                panel.get("acb_type", ""),
+                panel.get("ocr_type", ""),
+                panel.get("rated_current_in", ""),
+            )
+            self.panel_tree.insert("", "end", iid=str(idx), values=values)
 
     def _panel_select(self):
-        i = self.lst_panels.curselection()
-        if not i: return
-        p = self.panels_data[i[0]]
+        if not hasattr(self, "panel_tree"):
+            return
+        sel = self.panel_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.panels_data)):
+            return
+        p = self.panels_data[idx]
         for k,v in self.panel_vars.items():
             v.set(str(p.get(k,"")))
         self.txt_panel_circuits.delete("1.0","end")
         self.txt_panel_circuits.insert("1.0", "\n".join(p.get("circuits", [])))
 
     def _panel_apply(self):
-        i = self.lst_panels.curselection()
-        if not i: return
-        idx = i[0]
+        if not hasattr(self, "panel_tree"):
+            return
+        sel = self.panel_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.panels_data)):
+            return
         p = self.panels_data[idx]
         for k,v in self.panel_vars.items():
             p[k] = v.get().strip()
         cir_text = self.txt_panel_circuits.get("1.0","end").strip()
         p["circuits"] = [ln.strip() for ln in cir_text.splitlines() if ln.strip()]
         self.panels_data[idx] = p
+        self._panel_refresh_list()
+        item_id = str(idx)
+        if item_id in self.panel_tree.get_children():
+            self.panel_tree.selection_set(item_id)
+            self.panel_tree.focus(item_id)
         self.log(f"[OK] 패널 업데이트: {p.get('panel')}")
 
     def _em_refresh_list(self):
-        self.lst_em_codes.delete(0, "end")
-        for e in self.em_stops_data:
-            self.lst_em_codes.insert("end", f"{e.get('code','')}: {e.get('name','')}")
+        if not hasattr(self, "em_tree"):
+            return
+        current = None
+        sel = self.em_tree.selection()
+        if sel:
+            current = sel[0]
+        for item in self.em_tree.get_children():
+            self.em_tree.delete(item)
+        for idx, e in enumerate(self.em_stops_data):
+            code = e.get("code", "")
+            color = e.get("color", "")
+            name = e.get("name", "")
+            self.em_tree.insert("", "end", iid=str(idx), values=(code, color, name))
+        target = current if current in self.em_tree.get_children() else None
+        if target is None and self.em_stops_data:
+            target = "0"
+        if target is not None:
+            self.em_tree.selection_set(target)
+            self.em_tree.focus(target)
+            self._em_select()
+        elif hasattr(self, "txt_em_circuits"):
+            self.em_code.set("")
+            self.em_color.set("")
+            self.em_name.set("")
+            self._update_color_chip("")
+            self.txt_em_circuits.delete("1.0", "end")
 
     def _em_select(self):
-        i = self.lst_em_codes.curselection()
-        if not i: return
-        e = self.em_stops_data[i[0]]
+        if not hasattr(self, "em_tree"):
+            return
+        sel = self.em_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.em_stops_data)):
+            return
+        e = self.em_stops_data[idx]
         self.em_code.set(e.get("code",""))
+        self.em_color.set(e.get("color",""))
         self.em_name.set(e.get("name",""))
+        self._update_color_chip(e.get("color",""))
         blocks = []
+        code = e.get("code", "")
         for g in e.get("groups", []):
             header = g.get("panel_header","")
             circs = ", ".join(g.get("circuits", []))
-            blocks.append(f"[{header}]\n{circs}")
+            prefix = f"{code} " if code else ""
+            body = circs if circs else ""
+            blocks.append(f"{prefix}[{header}]\n{body}".strip())
         self.txt_em_circuits.delete("1.0","end")
         self.txt_em_circuits.insert("1.0","\n\n".join(blocks))
 
     def _em_apply(self):
-        i = self.lst_em_codes.curselection()
-        if not i: return
-        idx = i[0]
+        if not hasattr(self, "em_tree"):
+            return
+        sel = self.em_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.em_stops_data)):
+            return
         e = self.em_stops_data[idx]
         e["code"] = self.em_code.get().strip()
+        e["color"] = self.em_color.get().strip()
         e["name"] = self.em_name.get().strip()
-        blocks = [b.strip() for b in self.txt_em_circuits.get("1.0","end").strip().split("\n\n") if b.strip()]
+        raw_blocks = self.txt_em_circuits.get("1.0","end").strip()
+        blocks = [b.strip() for b in raw_blocks.split("\n\n") if b.strip()]
         groups = []
         for b in blocks:
             lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
-            if not lines: continue
-            header = lines[0].strip("[]")
-            circs = []
-            if len(lines) > 1:
-                for part in ",".join(lines[1:]).split(","):
-                    t = part.strip()
-                    if t: circs.append(t)
+            if not lines:
+                continue
+            first = lines[0]
+            header = first
+            if '[' in first and ']' in first:
+                header = first[first.find('[')+1:first.rfind(']')]
+            header = header.replace('*','').strip()
+            rest_text = "\n".join(lines[1:])
+            circs: List[str] = []
+            tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', rest_text.upper())
+            if not tokens:
+                tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', first.upper())
+            if tokens:
+                seen: List[str] = []
+                for t in tokens:
+                    if t not in seen:
+                        seen.append(t)
+                circs = seen
+            else:
+                raw = rest_text if rest_text else "".join(lines[1:])
+                if not raw:
+                    raw = " ".join(lines[1:])
+                for ln in lines[1:]:
+                    for part in re.split(r'[,、;]+', ln):
+                        val = part.strip()
+                        if val:
+                            circs.append(val)
             groups.append({"panel_header": header, "circuits": circs})
         e["groups"] = groups
         self.em_stops_data[idx] = e
         self._em_refresh_list()
+        item_id = str(idx)
+        if item_id in self.em_tree.get_children():
+            self.em_tree.selection_set(item_id)
+            self.em_tree.focus(item_id)
         self.log(f"[OK] Emergency 항목 업데이트: {e.get('code')}")
 
 if __name__ == "__main__":
