@@ -19,6 +19,17 @@ FAT AutoFill Pro (v2.0)
 {{ ms_munsell_code }}, {{ ms_ip }}, {{ ms_rating }}, {{ ms_dwg_no }}, {{ ms_rev_no }},
 {{ gsp_paint }}, {{ gsp_ip }}, {{ gsp_quantity }}, {{ gsp_dwg_no }}, {{ gsp_rev_no }}
 
+Function Test of GSP 항목을 사용하려면 다음 placeholder도 추가하세요.
+
+{{ gsp_function_no1 }}, {{ gsp_function_no2 }}
+
+ACB SETTING TABLE에서 자동으로 채워질 PANEL INFORMATION 항목을 사용하려면 아래 placeholder도 포함해야 합니다.
+
+- No.1 INCOMING PANEL: {{ ms_panel1 }}, {{ ms_acb_type1 }}, {{ ms_ocr_type1 }}, {{ ms_ampere_frame1 }}, {{ ms_rated_current_in1 }}, {{ ms_ir_percent1 }}, {{ ms_ir_amps1 }}
+- No.2 INCOMING PANEL: {{ ms_panel2 }}, {{ ms_acb_type2 }}, {{ ms_ocr_type2 }}, {{ ms_ampere_frame2 }}, {{ ms_rated_current_in2 }}, {{ ms_ir_percent2 }}, {{ ms_ir_amps2 }}
+- BUS-TIE: {{ ms_panel3 }}, {{ ms_acb_type3 }}, {{ ms_ocr_type3 }}, {{ ms_ampere_frame3 }}, {{ ms_rated_current_in3 }}, {{ ms_ir_percent3 }}, {{ ms_ir_amps3 }}
+- EMERGENCY PANEL: {{ ms_panel4 }}, {{ ms_acb_type4 }}, {{ ms_ocr_type4 }}, {{ ms_ampere_frame4 }}, {{ ms_rated_current_in4 }}, {{ ms_ir_percent4 }}, {{ ms_ir_amps4 }}
+
 동작 원리(요약)
 ----------------
 - 표지(1p): REV(우선) → 실패 시 파일명 REV.M 폴백, DWG No., Hull No., CLASS 표(리스트/범위) 파싱
