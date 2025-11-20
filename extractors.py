@@ -6,7 +6,8 @@ FAT AutoFill Extractors (v2.0)
 """
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+from collections import defaultdict
 import os, re
 import pdfplumber
 
@@ -66,37 +67,29 @@ def read_text(pdf_path: str, max_pages: int = 20) -> str:
 SN_BLOCK = re.compile(r'SN\d{4}(?:/\d{2})*')
 
 def _expand_sn_block(block: str) -> List[str]:
-    m = re.match(r'SN(\d{4})((?:/\d{2})*)$', block.replace(' ', ''))
+    token = block.replace(' ', '')
+    m = re.match(r'SN(\d{4})(.*)$', token)
     if not m:
         return []
     base = int(m.group(1))
-    out = [f"SN{base}"]
-    for two in re.findall(r'/(\d{2})', m.group(2) or ''):
-        out.append(f"SN{(base//100)*100 + int(two)}")
-    # === post-processing from NAME PLATE/GENERAL SPEC ===
-    try:
-        cap = extract_tr_capacity(msbd_text)
-        if cap:
-            out['ms_tr_capacity'] = cap
-    except Exception:
-        pass
-    try:
-        ms_ip, gsp_ip = extract_ip_grade(msbd_text, gsp_text)
-        if ms_ip:
-            out['ms_ip'] = ms_ip
-        if gsp_ip:
-            out['gsp_ip'] = gsp_ip
-    except Exception:
-        pass
-    # class from NAME PLATE (OTHER)
-    try:
-        hull = out.get('hull_no') or ''
-        cls_guess = guess_class_from_nameplate_other(msbd_text, hull)
-        if cls_guess:
-            out['class'] = cls_guess
-    except Exception:
-        pass
-    return out
+    tail = m.group(2) or ''
+    codes = {f"SN{base:04d}"}
+
+    range_match = re.search(r'~\s*(\d{4})', tail)
+    if range_match:
+        end = int(range_match.group(1))
+        lo, hi = sorted((base, end))
+        for val in range(lo, hi + 1):
+            codes.add(f"SN{val:04d}")
+
+    for part in re.findall(r'/\s*(\d{2,4})', tail):
+        if len(part) == 4:
+            codes.add(f"SN{int(part):04d}")
+        else:
+            prefix = str(base)[:4-len(part)]
+            codes.add(f"SN{int(prefix + part):04d}")
+
+    return sorted(codes)
 
 def guess_class_from_nameplate_other(text: str, hull_no: str) -> Optional[str]:
     cls = None
@@ -167,6 +160,43 @@ MUNSELL_RE = re.compile(r'\b\d{1,2}\s*(?:N|R|YR|Y|GY|G|BG|B|PB|P|RP)\s*\d(?:\.\d
 def clean_num(s: str) -> str:
     return re.sub(r'\s+', ' ', s.strip())
 
+PANEL_SLOT_SPECS = [
+    {
+        "slot": "no1",
+        "title": "No.1 INCOMING PANEL",
+        "aliases": ["NO1INCOMING", "NO1INCOMINGPANEL", "NO1MAININCOMING"],
+    },
+    {
+        "slot": "no2",
+        "title": "No.2 INCOMING PANEL",
+        "aliases": ["NO2INCOMING", "NO2INCOMINGPANEL", "NO2MAININCOMING"],
+    },
+    {
+        "slot": "bus",
+        "title": "BUS-TIE",
+        "aliases": ["BUSTIE", "BUSTIEPANEL", "BUSTIESWBD", "BUSTIESWITCHBOARD"],
+    },
+    {
+        "slot": "emg",
+        "title": "EMERGENCY PANEL",
+        "aliases": [
+            "EMERGENCYPANEL",
+            "EMERCYSWITCHBOARD",
+            "LINKTOEMCYSWITCHBOARD",
+            "LINKTOEMERGENCYSWITCHBOARD",
+        ],
+    },
+]
+
+PANEL_ROW_MARKERS = {
+    "acb_type": [r"ACB\s*(TYPE|MODEL)", r"AIR\s+CIRCUIT\s+BREAKER"],
+    "ocr_type": [r"OVERCURRENT\s+TRIP\s+TYPE", r"OCR\s*TYPE", r"TRIP\s*UNIT"],
+    "ampere_frame": [r"AMPERE\s*FRAME", r"\bAF\b", r"\bMCR\b"],
+    "rated_current_in": [r"RATED\s+CURRENT", r"\bI[NO]\b", r"IN\s*\(A\)"],
+    "ir_percent": [r"IR\s*\(%\)", r"IR\s*%", r"IR\s*SETTING"],
+    "ir_amps": [r"IR\s*\(A\)", r"IR\s*AMP"],
+}
+
 def find_rev_in_cover(p0: str) -> Optional[str]:
     pats = [
         r'\bREV\.?\s*NO\.?[\s:\-]*([A-Z0-9]+)',
@@ -227,6 +257,195 @@ def parse_class_table(p0: str) -> Dict[str, str]:
         for n in sorted(nums):
             result.setdefault(f"SN{n}", cls)  # first match wins
     return result
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+
+
+def _find_acb_setting_page(pdf) -> Tuple[Optional[int], Optional["pdfplumber.page.Page"]]:
+    for idx, page in enumerate(pdf.pages):
+        text_u = (page.extract_text() or "").upper()
+        if "ACB" not in text_u or "SETTING" not in text_u:
+            continue
+        if re.search(r"TABL[EI]|TABEL|TANLE|TABLE", text_u):
+            return idx, page
+    return None, None
+
+
+def _slot_ranges_from_words(words: List[Dict[str, Any]]) -> Dict[str, Tuple[float, float]]:
+    hits: Dict[str, List[float]] = defaultdict(list)
+    for w in words:
+        text = (w.get("text") or "").strip()
+        if not text:
+            continue
+        norm = re.sub(r'[^A-Z0-9]', '', text.upper())
+        if not norm:
+            continue
+        cx = (w.get("x0", 0.0) + w.get("x1", 0.0)) / 2.0
+        for spec in PANEL_SLOT_SPECS:
+            for alias in spec["aliases"]:
+                if alias and alias in norm:
+                    hits[spec["slot"]].append(cx)
+                    break
+    centers: List[Tuple[float, str]] = []
+    for slot, values in hits.items():
+        med = _median(values)
+        if med is not None:
+            centers.append((med, slot))
+    centers.sort()
+    ranges: Dict[str, Tuple[float, float]] = {}
+    for idx, (cx, slot) in enumerate(centers):
+        left = (centers[idx - 1][0] + cx) / 2.0 if idx > 0 else cx - 150.0
+        right = (cx + centers[idx + 1][0]) / 2.0 if idx + 1 < len(centers) else cx + 150.0
+        ranges[slot] = (left, right)
+    return ranges
+
+
+def _row_positions_from_words(words: List[Dict[str, Any]]) -> Dict[str, float]:
+    positions: Dict[str, float] = {}
+    for field, patterns in PANEL_ROW_MARKERS.items():
+        hits: List[float] = []
+        for w in words:
+            text = (w.get("text") or "").upper()
+            for pat in patterns:
+                if re.search(pat, text):
+                    hits.append((w.get("top", 0.0) + w.get("bottom", 0.0)) / 2.0)
+                    break
+        med = _median(hits)
+        if med is not None:
+            positions[field] = med
+    return positions
+
+
+def _words_in_band(
+    words: List[Dict[str, Any]], x0: float, x1: float, center_y: Optional[float], band: float = 18.0
+) -> List[Dict[str, Any]]:
+    if center_y is None:
+        return []
+    result: List[Dict[str, Any]] = []
+    for w in words:
+        cx = (w.get("x0", 0.0) + w.get("x1", 0.0)) / 2.0
+        if not (x0 <= cx <= x1):
+            continue
+        cy = (w.get("top", 0.0) + w.get("bottom", 0.0)) / 2.0
+        if abs(cy - center_y) <= band:
+            result.append(w)
+    return result
+
+
+def _numbers_from_words(words: List[Dict[str, Any]]) -> List[int]:
+    numbers: List[int] = []
+    for w in words:
+        text = str(w.get("text", ""))
+        for token in re.findall(r'\d+', text):
+            try:
+                numbers.append(int(token))
+            except Exception:
+                continue
+    return numbers
+
+
+def _blank_panel_records() -> List[Dict[str, str]]:
+    records: List[Dict[str, str]] = []
+    for spec in PANEL_SLOT_SPECS:
+        records.append(
+            {
+                "slot": spec["slot"],
+                "panel": spec["title"],
+                "acb_type": "",
+                "ocr_type": "",
+                "ampere_frame": "",
+                "rated_current_in": "",
+                "ir_percent": "",
+                "ir_amps": "",
+            }
+        )
+    return records
+
+
+def extract_acb_setting_panels(msbd_pdf: str) -> List[Dict[str, str]]:
+    base_records = _blank_panel_records()
+    if not (msbd_pdf and os.path.exists(msbd_pdf)):
+        return base_records
+    try:
+        with pdfplumber.open(msbd_pdf) as pdf:
+            _, page = _find_acb_setting_page(pdf)
+            if page is None:
+                return base_records
+            words = page.extract_words() or []
+            slot_ranges = _slot_ranges_from_words(words)
+            row_positions = _row_positions_from_words(words)
+            record_map = {rec["slot"]: rec for rec in base_records}
+            for spec in PANEL_SLOT_SPECS:
+                record = record_map.get(spec["slot"])
+                bounds = slot_ranges.get(spec["slot"])
+                if not record or not bounds:
+                    continue
+                x0, x1 = bounds
+                # ACB TYPE
+                y = row_positions.get("acb_type")
+                if y is not None:
+                    texts = [
+                        (w.get("text") or "").strip().upper()
+                        for w in _words_in_band(words, x0, x1, y, band=18.0)
+                        if (w.get("text") or "").strip()
+                    ]
+                    picks = [t for t in texts if re.match(r"[A-Z]{2,}[0-9][A-Z0-9\-]*$", t)]
+                    if picks:
+                        record["acb_type"] = picks[0]
+
+                # OCR TYPE
+                y = row_positions.get("ocr_type")
+                if y is not None:
+                    texts = [
+                        (w.get("text") or "").strip().upper()
+                        for w in _words_in_band(words, x0, x1, y, band=18.0)
+                        if (w.get("text") or "").strip()
+                    ]
+                    picks = [t for t in texts if re.match(r"[A-Z]{2,}[0-9]{0,3}[A-Z]?$", t)]
+                    if picks:
+                        record["ocr_type"] = picks[0]
+
+                # AMPERE FRAME
+                y = row_positions.get("ampere_frame")
+                if y is not None:
+                    nums = [n for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0)) if n >= 400]
+                    if nums:
+                        record["ampere_frame"] = str(max(nums))
+
+                # RATED CURRENT IN
+                y = row_positions.get("rated_current_in")
+                if y is not None:
+                    nums = _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0))
+                    if nums:
+                        record["rated_current_in"] = str(max(nums))
+
+                # IR (%)
+                y = row_positions.get("ir_percent")
+                if y is not None:
+                    nums = [
+                        n
+                        for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0))
+                        if 10 <= n <= 150
+                    ]
+                    if nums:
+                        record["ir_percent"] = str(max(nums))
+
+                # IR (A)
+                y = row_positions.get("ir_amps")
+                if y is not None:
+                    nums = [n for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0)) if n >= 100]
+                    if nums:
+                        record["ir_amps"] = str(max(nums))
+        return base_records
+    except Exception:
+        return base_records
 
 # ------------------------
 # Cover Parser
@@ -482,123 +701,421 @@ def detect_checked_ip(pdf_path: str) -> str | None:
 
 
 def parse_panel_blocks_v2(msbd_pdf: str, gsp_pdf: str) -> List[Dict[str, object]]:
-    U_ms = read_text(msbd_pdf, max_pages=50).upper()
-    _notify_progress(30, "PANELS:MSBD")
-    U_gs = read_text(gsp_pdf, max_pages=50).upper()
-    _notify_progress(50, "PANELS:GSP")
-    U = U_ms + "\n" + U_gs
+    _notify_progress(40, "PANELS:MSBD")
+    records = extract_acb_setting_panels(msbd_pdf) or []
+    return records
 
-    panels: List[Dict[str, object]] = []
-    names: List[str] = []
-    for m in re.finditer(r"NO\.?\s*(1|2)\s*INCOMING", U):
-        n=m.group(1); nm=f"No.{n} INCOMING"
-        if nm not in names: names.append(nm)
-    if re.search(r"BUS\s*-?\s*TIE\s*PANEL", U): names.append("BUS-TIE")
-    if re.search(r"EM'?CY\s*(SWBD|SWITCHBOARD)", U) or re.search(r"LINK\s*TO\s*ESBD", U): names.append("EMERGENCY PANEL")
 
-    def near(name, pat):
-        for m in re.finditer(re.escape(name.upper()), U):
-            s=max(0,m.start()-1200); e=min(len(U),m.end()+1200)
-            chunk = U[s:e]
-            mm = re.search(pat, chunk, re.I)
-            if mm: return mm.group(1)
+def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
+    if not (pdf_path and os.path.exists(pdf_path)):
+        return []
+
+    code_pat = re.compile(r'P3[12]-\d{3}-\d{2}-PN', re.I)
+    header_pat = re.compile(
+        r'^(CIRCUIT\s+NAME|CIR\.?\s*NO|TYPE|MAT\'|RATING|MOTOR|SELECTING|SWITCH|LOAD|CONTROL|AMMETER|VOLTMETER|FREQUENCY|REMARK|NOTE|RESULT|STATUS|TEST|FRAME|CAPACITY|WIRING|WIRE|PANEL|POWER|MODEL|SPEC|SIZE|DATE|UNIT)',
+        re.I,
+    )
+
+    def circuit_sort_key(code: str) -> Tuple[int, int, int, str]:
+        pattern = re.compile(r'P(\d+)-(\d+)-(\d+)-([A-Z]+)', re.I)
+        m = pattern.match(code or "")
+        if m:
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4).upper())
+        return (9999, 9999, 9999, (code or "").upper())
+
+    def clean(text: str) -> str:
+        text = re.sub(r'\s+', ' ', text or '')
+        return text.strip(" :-·•")
+
+    def group_words(words: List[Dict[str, Any]], y_tol: float = 2.5) -> List[List[Dict[str, Any]]]:
+        lines: List[Dict[str, Any]] = []
+        for w in sorted(words, key=lambda w: (w.get("top", 0), w.get("x0", 0))):
+            mid = (w.get("top", 0) + w.get("bottom", 0)) / 2.0
+            if not lines or abs(lines[-1]["mid"] - mid) > y_tol:
+                lines.append({"mid": mid, "words": [w]})
+            else:
+                bucket = lines[-1]
+                prev = len(bucket["words"])
+                bucket["words"].append(w)
+                bucket["mid"] = (bucket["mid"] * prev + mid) / (prev + 1)
+        return [sorted(item["words"], key=lambda w: w.get("x0", 0)) for item in lines if item.get("words")]
+
+    def detect_name_column_bounds(lines: List[List[Dict[str, Any]]]) -> Optional[Tuple[float, float]]:
+        """Return (x_start, x_end) bounds for CIRCUIT NAME column.
+
+        We search more header rows and also fall back to locating the next
+        detected header cell if the immediate neighbor can't be found on the
+        same line."""
+
+        # Scan a generous portion of the page so that the header is always seen
+        for words in lines[:60]:
+            tokens = [(w.get("text", "") or "") for w in words]
+            joined = " ".join(t.upper() for t in tokens)
+            if "CIRCUIT" not in joined or "NAME" not in joined:
+                continue
+            start = None
+            end = None
+            # Pass 1: find the NAME token and its immediate neighbor on the same line
+            for idx, w in enumerate(words):
+                token = (w.get("text", "") or "").upper()
+                if "NAME" in token and start is None:
+                    start = w.get("x0", 0) - 2
+                    for nxt in words[idx + 1 :]:
+                        nxt_token = (nxt.get("text", "") or "").upper()
+                        if header_pat.match(nxt_token):
+                            end = nxt.get("x0", 0) - 2
+                            break
+                        if re.search(r"ELASTIC|RATING|INITIAL|USED|USE|CONTROL|CURRENT", nxt_token):
+                            end = nxt.get("x0", 0) - 2
+                            break
+                    if end is None:
+                        # look ahead in the same line for the first header-looking cell after the name
+                        later_headers = [
+                            w2.get("x0", 0)
+                            for w2 in words[idx + 1 :]
+                            if header_pat.match((w2.get("text", "") or "").upper())
+                        ]
+                        if later_headers:
+                            end = min(later_headers) - 2
+                    break
+
+            # Pass 2: if we found the start but not the end, probe other header rows
+            if start is not None and end is None:
+                header_xs = []
+                for hdr_words in lines[:60]:
+                    for hw in hdr_words:
+                        token = (hw.get("text", "") or "").upper()
+                        if header_pat.match(token) and hw.get("x0", 0) > start + 20:
+                            header_xs.append(hw.get("x0", 0))
+                if header_xs:
+                    end = min(header_xs) - 2
+
+            if start is not None:
+                if end is None:
+                    end = start + 260  # slightly wider safety net
+                return (start, end)
         return None
 
-    for idx, nm in enumerate(names, start=1):
-        _notify_progress(50 + int(10*idx/max(1,len(names))), f"PANEL {nm}")
-        p = {
-            "panel": nm,
-            "acb_type": (near(nm, r"(?:AIR\s+CIRCUIT\s+BREAKER\s+TYPE|ACB\s*(?:TYPE|MODEL))\s*[:=\-]?\s*([A-Z0-9\-]+)") or ""),
-            "ocr_type": (near(nm, r"(?:OVERCURRENT\s+TRIP\s+TYPE|OCR\s*(?:TYPE)?|TRIP\s*UNIT)\s*[:=\-]?\s*([A-Z0-9\-]+)") or ""),
-            "ampere_frame": (near(nm, r"(?:AF|AMPERE\s*FRAME|MCR)\s*[:=\-]?\s*(\d{3,5})") or ""),
-            "rated_current_in": (near(nm, r"(?:RATED\s+CURRENT\s*\(?I[NO]\)?|IN\s*\(A\)|IN\s*[:=])\s*[:=]?\s*([\d,]+)") or ""),
-            "ip": (lambda x: (f"IP{x}" if x and not str(x).upper().startswith("IP") else x))(near(nm, r"\bIP[-\s]?([0-9]{2})\b")),
-            "paint": near(nm, r"(?:MUNSELL|PAINT)\s*[:=\-]?\s*([0-9A-Z\s/\-]+)"),
-            "ir_percent": near(nm, r"\bIR\s*[:=]\s*(\d{2,3})\s*\%"),
-            "ir_amps": near(nm, r"\bIR\s*\(A\)\s*[:=]\s*(\d{3,5})"),
-            "isd_percent": near(nm, r"\bISD\s*[:=]\s*(\d{2,3})\s*\%"),
-            "isd_amps": near(nm, r"\bISD\s*\(A\)\s*[:=]\s*(\d{3,5})"),
-            "setting_time_s": near(nm, r"TIME\s*\(SEC\)\s*(?:SET|=)\s*(\d{1,3})"),
-            "setting_time_ms": near(nm, r"TIME\s*\(MSEC\)\s*(?:SET|=)\s*(\d{2,4})"),
-            "remarks": "",
-            "circuits": []
-        }
-        panels.append(p)
+    def detect_panel_label(text: str) -> Optional[str]:
+        if not text:
+            return None
+        match_no1 = re.search(r'NO\.?\s*1\s*(?:GROUP\s+STARTER\s+PANEL|GSP)', text)
+        match_no2 = re.search(r'NO\.?\s*2\s*(?:GROUP\s+STARTER\s+PANEL|GSP)', text)
+        if match_no1 and match_no2:
+            return "No.1 GROUP STARTER PANEL" if match_no1.start() <= match_no2.start() else "No.2 GROUP STARTER PANEL"
+        if match_no1:
+            return "No.1 GROUP STARTER PANEL"
+        if match_no2:
+            return "No.2 GROUP STARTER PANEL"
+        return None
 
-    cir = []
-    for c in re.findall(r"P3[12]-\d{3}-\d{2}-PN", U):
-        if c not in cir: cir.append(c)
-    for p in panels:
-        if "NO.1" in p["panel"].upper():
-            p["circuits"] = [x for x in cir if x.startswith("P31-")]
-        elif "NO.2" in p["panel"].upper():
-            p["circuits"] = [x for x in cir if x.startswith("P32-")]
-        # Merge fallback with coordinate-based ACB SETTING TABLE (only fill empty fields)
-        try:
-            pinfos = extract_panel_info_from_msbd(msbd_pdf_path)
-            if isinstance(pinfos, list):
-                norm = {p.get("panel","").upper(): p for p in pinfos}
-                for p in panels:
-                    key = str(p.get("panel","")).upper()
-                    q = norm.get(key)
-                    if not q:
+    def finalize_pending(pending: Optional[Dict[str, Any]], store: Dict[str, List[Dict[str, Any]]]):
+        if not pending:
+            return
+        label = pending.get("label")
+        if not label:
+            return
+        name = clean(" ".join(pending.get("name_parts", [])))
+        if name:
+            store[label].append(
+                {
+                    "code": pending["code"],
+                    "name": name,
+                    "order": pending.get("order", 0),
+                }
+            )
+
+    panel_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    panel_order: Dict[str, int] = defaultdict(int)
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    continue
+                upper = text.upper()
+                if "NAME PLATE" not in upper or "GSP" not in upper:
+                    continue
+                words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+                if not words:
+                    continue
+                lines = group_words(words)
+                if not lines:
+                    continue
+                name_bounds = detect_name_column_bounds(lines)
+                name_col = name_bounds[0] if name_bounds else None
+                name_col_end = name_bounds[1] if name_bounds else None
+
+                pending: Optional[Dict[str, Any]] = None
+                current_label: Optional[str] = None
+
+                for line_words in lines:
+                    line_text = clean(" ".join(w.get("text", "") for w in line_words))
+                    if not line_text:
+                        finalize_pending(pending, panel_rows)
+                        pending = None
                         continue
-                    for k in ["acb_type","ocr_type","ampere_frame","rated_current_in","ip","paint","ir_percent","ir_amps","isd_percent","isd_amps","setting_time_s","setting_time_ms"]:
-                        if not p.get(k):
-                            v = q.get(k)
-                            if v:
-                                p[k] = v
-        except Exception as _e:
-            pass
+                    upper_line = line_text.upper()
+                    panel_label = detect_panel_label(upper_line)
+                    if panel_label:
+                        finalize_pending(pending, panel_rows)
+                        pending = None
+                        current_label = panel_label
+                        continue
+                    if upper_line.startswith("NAME PLATE") or header_pat.match(upper_line):
+                        finalize_pending(pending, panel_rows)
+                        pending = None
+                        continue
+                    match = code_pat.search(upper_line)
+                    if match:
+                        finalize_pending(pending, panel_rows)
+                        if not current_label:
+                            continue
+                        code = match.group(0).upper()
+                        code_norm = re.sub(r'[^A-Z0-9]+', '', code)
+                        code_word = None
+                        for w in line_words:
+                            word_norm = re.sub(r'[^A-Z0-9]+', '', (w.get("text", "") or '').upper())
+                            if code_norm and code_norm in word_norm:
+                                code_word = w
+                                break
+                        base_x = code_word.get("x1", code_word.get("x0", 0)) if code_word else None
+                        threshold = name_col if name_col is not None else None
+                        if threshold is None:
+                            threshold = (base_x or 0) + 4
+                        name_words = [w for w in line_words if w.get("x0", 0) >= threshold - 1]
+                        if name_col_end is not None:
+                            name_words = [w for w in name_words if w.get("x1", 0) <= name_col_end + 2]
+                        name_part = clean(" ".join(w.get("text", "") for w in name_words))
+                        pending = {
+                            "code": code,
+                            "name_parts": [],
+                            "order": panel_order[current_label],
+                            "name_x0": threshold,
+                            "name_x1": name_col_end,
+                            "label": current_label,
+                        }
+                        panel_order[current_label] += 1
+                        if name_part and not header_pat.match(name_part.upper()):
+                            pending["name_parts"].append(name_part)
+                        continue
+                    if pending:
+                        name_x0 = pending.get("name_x0", 0)
+                        name_x1 = pending.get("name_x1")
+                        min_x = min((w.get("x0", 0) for w in line_words), default=0)
+                        max_x = max((w.get("x1", 0) for w in line_words), default=0)
+                        within_left = min_x >= name_x0 - 4
+                        within_right = True if name_x1 is None else max_x <= name_x1 + 4
+                        if within_left and within_right:
+                            part = clean(" ".join(w.get("text", "") for w in line_words))
+                            if part and not header_pat.match(part.upper()):
+                                pending["name_parts"].append(part)
+                                continue
+                        finalize_pending(pending, panel_rows)
+                        pending = None
 
-    return panels
+                finalize_pending(pending, panel_rows)
+    except Exception:
+        return []
+
+    results: List[Dict[str, object]] = []
+    for num, label in ((1, "No.1 GROUP STARTER PANEL"), (2, "No.2 GROUP STARTER PANEL")):
+        rows = panel_rows.get(label)
+        if not rows:
+            continue
+        unique: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            code = (row.get("code") or "").upper()
+            name = (row.get("name") or "").strip()
+            if not code or not name:
+                continue
+            if code not in unique or len(name) > len(unique[code]["name"]):
+                unique[code] = {
+                    "code": code,
+                    "name": name,
+                    "order": row.get("order", 0),
+                }
+        if not unique:
+            continue
+        sorted_rows = sorted(unique.values(), key=lambda r: (circuit_sort_key(r.get("code", "")), r.get("order", 0)))
+        content = "\n".join(f"{row['code']} {row['name']}" for row in sorted_rows).strip()
+        results.append(
+            {
+                "panel": label,
+                "placeholder": f"gsp_function_no{num}",
+                "content": content,
+                "rows": sorted_rows,
+            }
+        )
+
+    return results
 
 
 def parse_emergency_stop(pdf_path: str) -> List[Dict[str, object]]:
-    # Try to find EMERGENCY STOP TEST table (report-like)
-    T = read_text(pdf_path, max_pages=60)
-    U = T.upper()
-    items = []
-    # Very light: capture lines like ES-1A ... text
-    for ln in [ln.strip() for ln in U.splitlines() if ln.strip()]:
-        m = re.search(r'\b(ES|CO2|FOAM|PT)-\d+[A-Z]?\b', ln)
-        if m:
-            code = m.group(0)
-            # Name: strip code itself
-            name = re.sub(code, "", ln).strip(" :-·().")
-            items.append({"code": code, "name": name, "groups": []})
-    # Dedup by code
-    uniq = {}
-    for it in items:
-        uniq.setdefault(it["code"], it)
-    out = list(uniq.values())
-    return out
+    """Parse EMERGENCY STOP TEST table including COLOR and panel groups."""
+    raw = read_text(pdf_path, max_pages=80)
+    if not raw:
+        return []
+    text = raw.replace("\r", "\n").replace("\x0c", "\n")
+    upper = text.upper()
+    code_pattern = re.compile(r'\b(?:ES|CO2|FOAM|PT)-\d+[A-Z]?\b')
+    matches = list(code_pattern.finditer(upper))
+    if not matches:
+        return []
+
+    def clean_line(line: str) -> str:
+        line = re.sub(r'\s+', ' ', line)
+        return line.strip(" :-·•.\t")
+
+    records: List[Dict[str, object]] = []
+    for idx, match in enumerate(matches):
+        code = match.group(0)
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        block = text[start:end]
+        remainder = block[len(code):]
+        remainder = remainder.lstrip()
+        color = ""
+        if remainder.startswith("("):
+            close_idx = remainder.find(")")
+            if close_idx != -1:
+                color = remainder[1:close_idx].strip()
+                remainder = remainder[close_idx + 1 :].lstrip()
+
+        lines = remainder.splitlines()
+        name_lines: List[str] = []
+        consumed = 0
+        for line in lines:
+            cleaned = clean_line(line)
+            consumed += 1
+            if not cleaned:
+                continue
+            if cleaned.upper().startswith("SATISFACTORY"):
+                continue
+            if cleaned.startswith("[") or code_pattern.search(cleaned.upper()):
+                consumed -= 1
+                break
+            if re.search(r'P\d{2}-\d{3}-\d{2}-', cleaned.upper()):
+                consumed -= 1
+                break
+            name_lines.append(cleaned)
+            if "[" in line:
+                break
+        if consumed < 0:
+            consumed = 0
+        name = " ".join(name_lines).strip()
+        remaining_text = "\n".join(lines[consumed:])
+
+        groups: List[Dict[str, object]] = []
+        panel_matches = list(re.finditer(r'\[([^\]]{2,120})\]', remaining_text))
+        if panel_matches:
+            for g_idx, gm in enumerate(panel_matches):
+                header = gm.group(1).replace('*', '').strip()
+                seg_start = gm.end()
+                seg_end = panel_matches[g_idx + 1].start() if g_idx + 1 < len(panel_matches) else len(remaining_text)
+                segment = remaining_text[seg_start:seg_end]
+                circuits = _parse_circuit_list(segment)
+                groups.append({"panel_header": header, "circuits": circuits})
+        else:
+            # fallback: scan lines for headers starting with NO.
+            pending_header = None
+            buffer_text: List[str] = []
+            for line in remaining_text.splitlines():
+                cleaned = clean_line(line)
+                if not cleaned:
+                    continue
+                if cleaned.startswith("NO.") or cleaned.startswith("№"):
+                    if pending_header:
+                        circuits = _parse_circuit_list("\n".join(buffer_text))
+                        groups.append({"panel_header": pending_header, "circuits": circuits})
+                    pending_header = cleaned
+                    buffer_text = []
+                    continue
+                buffer_text.append(cleaned)
+            if pending_header:
+                circuits = _parse_circuit_list("\n".join(buffer_text))
+                groups.append({"panel_header": pending_header, "circuits": circuits})
+
+        records.append({
+            "code": code,
+            "color": color,
+            "name": name,
+            "groups": groups,
+        })
+
+    merged: Dict[str, Dict[str, object]] = {}
+    for rec in records:
+        code = rec.get("code", "")
+        if code in merged:
+            existing = merged[code]
+            if not existing.get("name") and rec.get("name"):
+                existing["name"] = rec.get("name")
+            if not existing.get("color") and rec.get("color"):
+                existing["color"] = rec.get("color")
+            existing_groups = existing.setdefault("groups", [])
+            for g in rec.get("groups", []):
+                if g not in existing_groups:
+                    existing_groups.append(g)
+        else:
+            merged[code] = rec
+    return list(merged.values())
+
+
+def _parse_circuit_list(chunk: str) -> List[str]:
+    tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', chunk.upper())
+    if tokens:
+        seen: List[str] = []
+        for tok in tokens:
+            if tok not in seen:
+                seen.append(tok)
+        return seen
+    parts: List[str] = []
+    for line in chunk.splitlines():
+        for part in re.split(r'[\s,;\u3001]+', line):
+            val = part.strip()
+            if val:
+                parts.append(val)
+    return parts
 
 
 def parse_emergency_colorplate(msbd_pdf: str) -> List[Dict[str, object]]:
-    U = read_text(msbd_pdf, max_pages=60).upper()
-    pos = U.find("COLOR PLATE SPECIFICATION")
-    window = U[max(0, pos-2000): pos+8000] if pos != -1 else U
-    items = []
-    for ln in [ln.strip() for ln in window.splitlines() if ln.strip()]:
-        m = re.findall(r'\b(ES|CO2|FOAM|PT)-\d+[A-Z]?\b', ln)
-        if not m: continue
-        name = re.sub(r'\b(ES|CO2|FOAM|PT)-\d+[A-Z]?\b', "", ln).strip(" :-·().")
-        for code in m:
-            # code here is only prefix, fix: use full match above
-            pass
-    # Use robust regex again to match code+name
-    items = []
-    for m in re.finditer(r'\b((?:ES|CO2|FOAM|PT)-\d+[A-Z]?)\b[\s:.-]*([^\n]{0,80})', window):
+    raw = read_text(msbd_pdf, max_pages=60)
+    if not raw:
+        return []
+    upper = raw.upper()
+    pos = upper.find("COLOR PLATE SPECIFICATION")
+    window = raw[max(0, pos-2000): pos+8000] if pos != -1 else raw
+
+    pattern = re.compile(r'\b((?:ES|CO2|FOAM|PT)-\d+[A-Z]?)\b', re.I)
+    items: List[Dict[str, object]] = []
+    for m in pattern.finditer(window):
         code = m.group(1).upper()
-        name = m.group(2).strip()
-        items.append({"code": code, "name": name, "groups": []})
-    # Dedup preserve order
-    seen=set(); out=[]
+        tail = window[m.end(): m.end() + 160]
+        tail_strip = tail.lstrip()
+        color = ""
+        if tail_strip.startswith("("):
+            end = tail_strip.find(")")
+            if end != -1:
+                color = tail_strip[1:end].strip()
+                tail_strip = tail_strip[end + 1 :].lstrip()
+        first_line = tail_strip.splitlines()[0] if tail_strip else ""
+        name = first_line.strip(" :-·().")
+        items.append({"code": code, "name": name, "color": color, "groups": []})
+
+    seen: Dict[str, Dict[str, object]] = {}
     for it in items:
-        if it["code"] in seen: continue
-        seen.add(it["code"]); out.append(it)
-    return out
+        code = it.get("code", "")
+        if code in seen:
+            target = seen[code]
+            if not target.get("name") and it.get("name"):
+                target["name"] = it.get("name")
+            if not target.get("color") and it.get("color"):
+                target["color"] = it.get("color")
+        else:
+            seen[code] = it
+    return list(seen.values())
 # ===== Overwrite with checkbox-aware IP extractor =====
 def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
     """Detect IP grade from GENERAL SPEC via checkbox detection."""
@@ -647,73 +1164,6 @@ def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
         txt = extract_text_fast(pdf_path).upper()
         m = re.search(r"\bIP\s*([0-9]{2})\b", txt)
         return f"IP{m.group(1)}" if m else ""
-
-# -----------------------------------------------
-# PANEL INFORMATION from MSBD "ACB SETTING TABLE"
-# -----------------------------------------------
-def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:
-    """Coordinate-based, best-effort extraction of panel information."""
-    result = []
-    try:
-        import pdfplumber, re
-        with pdfplumber.open(msbd_pdf_path) as pdf:
-            target = None
-            for page in pdf.pages:
-                t = (page.extract_text() or "").upper()
-                if "ACB" in t and "SETTING" in t and "TABLE" in t:
-                    target = page
-                    break
-            if target is None:
-                return result
-            words = target.extract_words() or []
-            panels = []
-            for w in words:
-                txt = w["text"].upper().strip()
-                if re.match(r"NO\.\s*\d+\s+INCOMING", txt) or txt in ("BUS-TIE","BUS TIE","EMERGENCY PANEL","LINK TO EM'CY SWITCHBOARD","LINK TO EM’CY SWITCHBOARD"):
-                    panels.append((txt, (w["x0"]+w["x1"]) / 2.0))
-            panels = sorted({(n,x) for n,x in panels}, key=lambda v: v[1])
-            if not panels:
-                return result
-            cols = []
-            for i,(name,cx) in enumerate(panels):
-                x_left = (panels[i-1][1] + cx)/2.0 if i>0 else cx-120
-                x_right = (cx + panels[i+1][1])/2.0 if i < len(panels)-1 else cx+120
-                cols.append((name, x_left, x_right))
-            def find_row_y(pattern):
-                ys = [ ((w["top"]+w["bottom"]) / 2.0) for w in words if re.search(pattern, w["text"].upper()) ]
-                if not ys: return None
-                ys.sort()
-                return ys[len(ys)//2]
-            y_acb = find_row_y(r"AIR\s+CIRCUIT\s+BREAKER\s+TYPE|ACB\s*TYPE|ACB\s*MODEL")
-            y_ocr = find_row_y(r"OVERCURRENT\s+TRIP\s+TYPE|TRIP\s*UNIT|OCR\s*TYPE")
-            y_af  = find_row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b")
-            y_in  = find_row_y(r"RATED\s+CURRENT|\bI[NO]\b")
-            def words_in_band(x0,x1,y,band=8.0):
-                return [w for w in words if x0 <= (w["x0"]+w["x1"]) / 2.0 <= x1 and abs(((w["top"]+w["bottom"]) / 2.0)-y) <= band]
-            for name, x0, x1 in cols:
-                info = {"panel":name, "acb_type":"", "ocr_type":"", "ampere_frame":"", "rated_current_in":"", "ip":"", "paint":"",
-                        "ir_percent":"", "isd_percent":"", "setting_time_s":"", "setting_time_ms":""}
-                if y_acb is not None:
-                    cands = [w["text"].upper() for w in words_in_band(x0,x1,y_acb)]
-                    m = [t for t in cands if re.match(r"[A-Z]{2,}[0-9]{2,}", t)]
-                    if m: info["acb_type"] = m[0]
-                if y_ocr is not None:
-                    cands = [w["text"].upper() for w in words_in_band(x0,x1,y_ocr)]
-                    m = [t for t in cands if re.match(r"[A-Z]{2,}", t)]
-                    if m: info["ocr_type"] = m[0]
-                if y_af is not None:
-                    nums = [re.sub(r"[^0-9]","", w["text"]) for w in words_in_band(x0,x1,y_af)]
-                    nums = [n for n in nums if n]
-                    if nums: info["ampere_frame"] = nums[0]
-                if y_in is not None:
-                    nums = [re.sub(r"[^0-9]","", w["text"]) for w in words_in_band(x0,x1,y_in)]
-                    nums = [n for n in nums if n]
-                    if nums: info["rated_current_in"] = nums[0]
-                result.append(info)
-        return result
-    except Exception:
-        return result
-
 
 # ==================== Patch: robust IP extractor & panel table reader (fix10) ====================
 
@@ -784,362 +1234,7 @@ def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
     return ""
 
 
-def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:  # type: ignore[override]
-    """Coordinate-based extraction of panel information from ACB SETTING TABLE (robust)."""
-    result: List[Dict[str, Any]] = []
-    try:
-        import pdfplumber, re
-        with pdfplumber.open(msbd_pdf_path) as pdf:
-            target = None
-            for pg in pdf.pages:
-                t = (pg.extract_text() or "").upper()
-                if "ACB" in t and "SETTING" in t and "TABLE" in t:
-                    target = pg; break
-            if target is None:
-                return result
-            words = target.extract_words() or []
-            def midx(w): return (w["x0"]+w["x1"])/2.0
-            def midy(w): return (w["top"]+w["bottom"])/2.0
-
-            # panel columns
-            panels = []
-            for w in words:
-                tx = w["text"].upper().strip()
-                if re.match(r"NO\.\s*\d+\s+INCOMING", tx) or tx in ("BUS-TIE","BUS TIE","EMERGENCY PANEL","LINK TO EM'CY SWITCHBOARD","LINK TO EM’CY SWITCHBOARD"):
-                    panels.append((tx, midx(w)))
-            panels = sorted({(n,x) for n,x in panels}, key=lambda v: v[1])
-            if not panels:
-                return result
-            cols = []
-            for i,(name,cx) in enumerate(panels):
-                xL = (panels[i-1][1] + cx)/2.0 if i>0 else cx-160
-                xR = (cx + panels[i+1][1])/2.0 if i < len(panels)-1 else cx+160
-                cols.append((name, xL, xR))
-
-            # row anchors
-            def row_y(pat):
-                ys = [ midy(w) for w in words if re.search(pat, w["text"].upper()) ]
-                if not ys: return None
-                ys.sort(); return ys[len(ys)//2]
-
-            y_acb = row_y(r"AIR\s+CIRCUIT\s+BREAKER\s+TYPE|ACB\s*(TYPE|MODEL)")
-            y_ocr = row_y(r"OVERCURRENT\s+TRIP\s+TYPE|TRIP\s*UNIT|OCR\s*(TYPE)?")
-            y_af  = row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b")
-            y_in  = row_y(r"RATED\s+CURRENT|\bI[NO]\b|\bIo\b|\bIn\b")
-
-            def band(x0,x1,y,dy=14.0):
-                return [w for w in words if x0 <= midx(w) <= x1 and (y is None or abs(midy(w)-y) <= dy)]
-
-            for name, x0, x1 in cols:
-                info = {"panel":name, "acb_type":"","ocr_type":"","ampere_frame":"","rated_current_in":"",
-                        "ip":"","paint":"","ir_percent":"","ir_amps":"","isd_percent":"","isd_amps":"",
-                        "setting_time_s":"","setting_time_ms":"","remarks":""}
-
-                # ACB TYPE
-                cand = [w["text"].upper() for w in band(x0,x1,y_acb)+band(x0,x1,y_acb,24.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{1,}[A-Z0-9\-]*$", t) and t not in ("SETTING","SETTINGS")]
-                if cand: info["acb_type"] = cand[0]
-
-                # OCR
-                cand = [w["text"].upper() for w in band(x0,x1,y_ocr)+band(x0,x1,y_ocr,24.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{0,2}$", t)]
-                if cand: info["ocr_type"] = cand[0]
-
-                # AF
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_af)+band(x0,x1,y_af,24.0)]
-                nums = [int(n) for n in nums if n]
-                nums = [n for n in nums if n >= 400]
-                if nums: info["ampere_frame"] = str(sorted(nums)[0])
-
-                # In/Io
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_in)+band(x0,x1,y_in,24.0)]
-                nums = [n for n in nums if n]
-                if nums: info["rated_current_in"] = nums[0]
-
-                result.append(info)
-        return result
-    except Exception:
-        return result
-
-
-# ---- override with slightly wider bands / aliases (fix11) ----
-def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:  # type: ignore[override]
-    result: List[Dict[str, Any]] = []
-    try:
-        import pdfplumber, re
-        with pdfplumber.open(msbd_pdf_path) as pdf:
-            target = None
-            for pg in pdf.pages:
-                t = (pg.extract_text() or "").upper()
-                if ("ACB" in t and "SETTING" in t and "TABLE" in t) or ("ACB" in t and "SETTING TABLE" in t):
-                    target = pg; break
-            if target is None:
-                return result
-            words = target.extract_words() or []
-            def midx(w): return (w["x0"]+w["x1"])/2.0
-            def midy(w): return (w["top"]+w["bottom"])/2.0
-
-            # panel columns (more aliases)
-            panels = []
-            for w in words:
-                tx = w["text"].upper().strip()
-                if re.match(r"NO\.\s*\d+\s*INCOMING", tx) or tx in ("BUS-TIE","BUS TIE","EMERGENCY PANEL","EMERGENCY","LINK TO EM'CY SWITCHBOARD","LINK TO EM’CY SWITCHBOARD"):
-                    panels.append((tx, midx(w)))
-            panels = sorted({(n,x) for n,x in panels}, key=lambda v: v[1])
-            if not panels:
-                return result
-            cols = []
-            for i,(name,cx) in enumerate(panels):
-                xL = (panels[i-1][1] + cx)/2.0 if i>0 else cx-180
-                xR = (cx + panels[i+1][1])/2.0 if i < len(panels)-1 else cx+180
-                cols.append((name, xL, xR))
-
-            # row anchors with more variants
-            def row_y(pat):
-                ys = [ ((w["top"]+w["bottom"])/2.0) for w in words if re.search(pat, w["text"].upper()) ]
-                if not ys: return None
-                ys.sort(); return ys[len(ys)//2]
-
-            y_acb = row_y(r"ACB\s*(TYPE|MODEL)|AIR\s+CIRCUIT\s+BREAKER")
-            y_ocr = row_y(r"TRIP\s*UNIT|OVERCURRENT\s*(TRIP)?\s*TYPE|OCR\s*(TYPE)?")
-            y_af  = row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b|FRAME\s*\(A\)")
-            y_in  = row_y(r"RATED\s*CURRENT|\bI[NO]\b|\bIO\b|\bIN\b|SETTING\s*CURRENT")
-
-            def band(x0,x1,y,dy=18.0):
-                return [w for w in words if x0 <= (w["x0"]+w["x1"])/2.0 <= x1 and (y is None or abs(((w["top"]+w["bottom"])/2.0)-y) <= dy)]
-
-            for name, x0, x1 in cols:
-                info = {"panel":name, "acb_type":"","ocr_type":"","ampere_frame":"","rated_current_in":"",
-                        "ip":"","paint":"","ir_percent":"","ir_amps":"","isd_percent":"","isd_amps":"",
-                        "setting_time_s":"","setting_time_ms":"","remarks":""}
-
-                cand = [w["text"].upper() for w in band(x0,x1,y_acb)+band(x0,x1,y_acb,26.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{1,}[A-Z0-9\-]*$", t) and t not in ("SETTING","SETTINGS")]
-                if cand: info["acb_type"] = cand[0]
-
-                cand = [w["text"].upper() for w in band(x0,x1,y_ocr)+band(x0,x1,y_ocr,26.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{0,2}$", t)]
-                if cand: info["ocr_type"] = cand[0]
-
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_af)+band(x0,x1,y_af,26.0)]
-                nums = [int(n) for n in nums if n]
-                nums = [n for n in nums if n >= 400]
-                if nums: info["ampere_frame"] = str(sorted(nums)[0])
-
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_in)+band(x0,x1,y_in,26.0)]
-                nums = [n for n in nums if n]
-                if nums: info["rated_current_in"] = nums[0]
-
-                result.append(info)
-        return result
-    except Exception:
-        return result
-
-
-# ---- override: IP from GENERAL SPEC page only (fix12) ----
-def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
-    """
-    Detect IP grade strictly from the GENERAL SPEC page.
-    Looks for IPxx tokens and checks for a checkmark (■/●/◼ or filled rect) right/left.
-    """
-    import re
-    try:
-        import pdfplumber
-    except Exception:
-        txt = extract_text_fast(pdf_path).upper()
-        # fallback: nearest "GENERAL"..."IPxx" pattern
-        block = ""
-        m = re.search(r"GENERAL.*?(IP\s*\d{2})", txt, flags=re.S)
-        if m: return "IP" + re.sub(r"\D", "", m.group(1))[-2:]
-        m = re.search(r"\bIP\s*([0-9]{2})\b", txt)
-        return f"IP{m.group(1)}" if m else ""
-
-    with pdfplumber.open(pdf_path) as pdf:
-        target = None
-        for pg in pdf.pages:
-            text_u = (pg.extract_text() or "").upper()
-            if "GENERAL" in text_u and "SPEC" in text_u:
-                target = pg; break
-        if target is None:
-            # fallback to first page
-            target = pdf.pages[0]
-
-        def ip_tokens(page):
-            toks = []
-            for w in page.extract_words() or []:
-                t = w.get("text","").upper()
-                m = re.match(r"IP[-\s]?([0-9]{2})\b", t)
-                if m: toks.append((int(m.group(1)), w))
-            return toks
-
-        def has_mark_near(page, w):
-            x0,x1,y0,y1 = w["x0"], w["x1"], w["top"], w["bottom"]
-            windows = [(x0-40, x0-4, y0-8, y1+8), (x1+4, x1+40, y0-8, y1+8)]
-            chars = page.chars or []
-            rects = [r for r in (page.rects or []) if r.get("non_stroking_color") is not None and 1.5 <= r.get("width",0) <= 14.0 and 1.5 <= r.get("height",0) <= 14.0]
-            for (mx0,mx1,my0,my1) in windows:
-                for c in chars:
-                    if c.get("text") in ("■","●","◼","▪","∙") and mx0 <= c.get("x0",0) <= mx1 and my0 <= c.get("top",0) <= my1:
-                        return True
-                for r in rects:
-                    cx = (r["x0"]+r["x1"])/2.0; cy = (r["top"]+r["bottom"])/2.0
-                    if mx0 <= cx <= mx1 and my0 <= cy <= my1:
-                        return True
-            return False
-
-        toks = ip_tokens(target)
-        if toks:
-            for val, w in toks:
-                if has_mark_near(target, w):
-                    return f"IP{val:02d}"
-            toks.sort(key=lambda t: (t[1]["x0"], t[1]["top"]))
-            return f"IP{toks[0][0]:02d}"
-    return ""
-
-
-# ---- override ACB TABLE finder with misspelling tolerance (fix12) ----
-def extract_panel_info_from_msbd(msbd_pdf_path: str) -> List[Dict[str, Any]]:  # type: ignore[override]
-    """
-    Coordinate-based extraction from ACB SETTING TABLE (tolerates TANLE/TABIE/TABEL typos).
-    """
-    result: List[Dict[str, Any]] = []
-    try:
-        import pdfplumber, re
-        with pdfplumber.open(msbd_pdf_path) as pdf:
-            target = None
-            for pg in pdf.pages:
-                t = (pg.extract_text() or "").upper()
-                if "ACB" in t and "SETTING" in t and (re.search(r"TABL[EI]|TANLE|TABEL", t) or "TABLE" in t):
-                    target = pg; break
-            if target is None:
-                return result
-            words = target.extract_words() or []
-            def midx(w): return (w["x0"]+w["x1"])/2.0
-            def midy(w): return (w["top"]+w["bottom"])/2.0
-
-            panels = []
-            for w in words:
-                tx = w["text"].upper().strip()
-                if re.match(r"NO\.\s*\d+\s*INCOMING", tx) or tx in ("BUS-TIE","BUS TIE","EMERGENCY PANEL","EMERGENCY","LINK TO EM'CY SWITCHBOARD","LINK TO EM’CY SWITCHBOARD"):
-                    panels.append((tx, midx(w)))
-            panels = sorted({(n,x) for n,x in panels}, key=lambda v: v[1])
-            if not panels:
-                return result
-            cols = []
-            for i,(name,cx) in enumerate(panels):
-                xL = (panels[i-1][1] + cx)/2.0 if i>0 else cx-180
-                xR = (cx + panels[i+1][1])/2.0 if i < len(panels)-1 else cx+180
-                cols.append((name, xL, xR))
-
-            def row_y(pat):
-                ys = [ midy(w) for w in words if re.search(pat, w["text"].upper()) ]
-                if not ys: return None
-                ys.sort(); return ys[len(ys)//2]
-
-            y_acb = row_y(r"ACB\s*(TYPE|MODEL)|AIR\s+CIRCUIT\s+BREAKER")
-            y_ocr = row_y(r"TRIP\s*UNIT|OVERCURRENT\s*(TRIP)?\s*TYPE|OCR\s*(TYPE)?")
-            y_af  = row_y(r"AMPERE\s*FRAME|\bAF\b|\bMCR\b|FRAME\s*\(A\)")
-            y_in  = row_y(r"RATED\s*CURRENT|\bI[NO]\b|\bIO\b|\bIN\b|SETTING\s*CURRENT")
-
-            def band(x0,x1,y,dy=18.0):
-                return [w for w in words if x0 <= midx(w) <= x1 and (y is None or abs(midy(w)-y) <= dy)]
-
-            for name, x0, x1 in cols:
-                info = {"panel":name, "acb_type":"","ocr_type":"","ampere_frame":"","rated_current_in":"",
-                        "ir_percent":"","ir_amps":"","isd_percent":"","isd_amps":"","remarks":""}
-
-                # ACB TYPE
-                cand = [w["text"].upper() for w in band(x0,x1,y_acb)+band(x0,x1,y_acb,26.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{1,}[A-Z0-9\-]*$", t) and t not in ("SETTING","SETTINGS")]
-                if cand: info["acb_type"] = cand[0]
-
-                # OCR/TRIP UNIT
-                cand = [w["text"].upper() for w in band(x0,x1,y_ocr)+band(x0,x1,y_ocr,26.0)]
-                cand = [t for t in cand if re.match(r"[A-Z]{2,}[0-9]{0,2}$", t)]
-                if cand: info["ocr_type"] = cand[0]
-
-                # AMPERE FRAME
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_af)+band(x0,x1,y_af,26.0)]
-                nums = [int(n) for n in nums if n]
-                nums = [n for n in nums if n >= 400]
-                if nums: info["ampere_frame"] = str(sorted(nums)[0])
-
-                # RATED CURRENT In/Io
-                nums = [re.sub(r"[^0-9]","", w["text"]) for w in band(x0,x1,y_in)+band(x0,x1,y_in,26.0)]
-                nums = [n for n in nums if n]
-                if nums: info["rated_current_in"] = nums[0]
-
-                result.append(info)
-        return result
-    except Exception:
-        return result
 
 # ---------------------------
-# override: force IP fallback to IP22 (GENERAL SPEC page only)
-# This definition intentionally appears at the end of the module to override any earlier versions.
-def extract_ip_grade(pdf_path: str, *args, **kwargs) -> str:  # type: ignore[override]
-    """
-    Determine IP grade from the GENERAL SPEC page. If no checked IP can be detected,
-    ALWAYS fall back to 'IP22' as per user's requirement.
-    Accepts *args/**kwargs to remain compatible with older call sites.
-    """
-    try:
-        import re
-        try:
-            import pdfplumber  # type: ignore
-        except Exception:
-            return "IP22"
 
-        def is_general_spec_page(text: str) -> bool:
-            t = (text or "").upper()
-            return ("GENERAL" in t and "SPEC" in t)
-
-        with pdfplumber.open(pdf_path) as pdf:  # type: ignore
-            target = None
-            for p in pdf.pages:
-                if is_general_spec_page(p.extract_text() or ""):
-                    target = p
-                    break
-            if target is None:
-                return "IP22"
-
-            tokens = []
-            for w in (target.extract_words() or []):
-                s = (w.get("text") or "").upper()
-                m = re.match(r"\bIP[-\s]?(\d{2})\b", s)
-                if m:
-                    try:
-                        tokens.append((int(m.group(1)), w))
-                    except Exception:
-                        pass
-            if not tokens:
-                return "IP22"
-
-            chars = target.chars or []
-            rects = [r for r in (getattr(target, "rects", []) or []) if r.get("nonstroking",0) or r.get("stroking",0)]
-            rects = [r for r in rects if 1.2 <= r.get("width",0) <= 16.0 and 1.2 <= r.get("height",0) <= 16.0]
-
-            def has_mark_near(w):
-                x0, x1 = w.get("x0", 0), w.get("x1", 0)
-                y0, y1 = w.get("top", 0), w.get("bottom", 0)
-                windows = [(x0-44, x0-2, y0-10, y1+10), (x1+2, x1+44, y0-10, y1+10)]
-                for (wx0, wx1, wy0, wy1) in windows:
-                    for c in chars:
-                        if c.get("text") in ("■","●","◼","▪","∙","•"):
-                            cx, cy = c.get("x0",0), c.get("top",0)
-                            if wx0 <= cx <= wx1 and y0-10 <= cy <= y1+10:
-                                return True
-                    for r in rects:
-                        rx, ry = r.get("x0",0), r.get("top",0)
-                        if wx0 <= rx <= wx1 and y0-10 <= ry <= y1+10:
-                            return True
-                return False
-
-            for val, w in tokens:
-                if has_mark_near(w):
-                    return f"IP{val:02d}"
-
-            return "IP22"
-    except Exception:
-        return "IP22"
-# ---------------------------
+extract_panel_info_from_msbd = extract_acb_setting_panels
