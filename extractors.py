@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-FAT AutoFill Extractors (v2.0)
+FAT AutoFill Extractors (v2.3)
 - MSBD/GSP PDF에서 표지 & GENERAL SPEC 영역 특정 항목을 안정적으로 추출
 - Pure-Python: pdfplumber + regex 기반
 """
@@ -742,7 +742,7 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
 
     def detect_name_column_bounds(lines: List[List[Dict[str, Any]]]) -> Optional[Tuple[float, float]]:
         """Return (x_start, x_end) bounds for CIRCUIT NAME column."""
-        for words in lines[:10]:
+        for words in lines[:60]:
             tokens = [(w.get("text", "") or "") for w in words]
             joined = " ".join(t.upper() for t in tokens)
             if "CIRCUIT" not in joined or "NAME" not in joined:
@@ -753,21 +753,22 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                 token = (w.get("text", "") or "").upper()
                 if "NAME" in token and start is None:
                     start = w.get("x0", 0) - 2
-                    # look for the next header word (e.g., ELASTIC, RATING, INITIAL, USE)
+                    # look for the next header word 
                     for nxt in words[idx + 1 :]:
                         nxt_token = (nxt.get("text", "") or "").upper()
-                        if header_pat.match(nxt_token):
-                            end = nxt.get("x0", 0) - 2
+                        # Extended pattern to catch more column headers
+                        if re.search(r"MOTOR|RATING|M/C.TR|KW|ELASTIC|INITIAL|USED|USE|CONTROL|CURRENT|ISOLATING|LOAD", nxt_token):
+                            end = nxt.get("x0", 0) - 5
                             break
-                        if re.search(r"ELASTIC|RATING|INITIAL|USED|USE|CONTROL|CURRENT", nxt_token):
-                            end = nxt.get("x0", 0) - 2
+                        if header_pat.match(nxt_token):
+                            end = nxt.get("x0", 0) - 5
                             break
                     if end is None:
                         # fallback to a generous width if we cannot locate the next column header
-                        end = start + 220
+                        end = start + 280
                     break
             if start is not None:
-                return (start, end if end is not None else start + 220)
+                return (start, end if end is not None else start + 280)
         return None
 
     def detect_panel_label(text: str) -> Optional[str]:
@@ -825,7 +826,7 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                 pending: Optional[Dict[str, Any]] = None
                 current_label: Optional[str] = None
 
-                for line_words in lines:
+                for idx, line_words in enumerate(lines):
                     line_text = clean(" ".join(w.get("text", "") for w in line_words))
                     if not line_text:
                         finalize_pending(pending, panel_rows)
@@ -855,20 +856,67 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                             if code_norm and code_norm in word_norm:
                                 code_word = w
                                 break
-                        base_x = code_word.get("x1", code_word.get("x0", 0)) if code_word else None
-                        threshold = name_col if name_col is not None else None
-                        if threshold is None:
-                            threshold = (base_x or 0) + 4
-                        name_words = [w for w in line_words if w.get("x0", 0) >= threshold - 1]
-                        if name_col_end is not None:
-                            name_words = [w for w in name_words if w.get("x1", 0) <= name_col_end + 2]
+                        code_x0 = code_word.get("x0", 0) if code_word else None
+                        code_x1 = code_word.get("x1", 0) if code_word else None
+
+                        # Prefer header-derived name bounds. If unavailable, anchor the name
+                        # area immediately to the RIGHT of the circuit code (the documented
+                        # layout) and scan downward within that band until another code/header
+                        # interrupts.
+                        name_words: List[Dict[str, Any]]
+                        if name_col is not None:
+                            name_x0 = name_col
+                            name_x1 = name_col_end
+                            name_words = [
+                                w
+                                for w in line_words
+                                if w.get("x0", 0) >= name_col - 1
+                                and (name_col_end is None or w.get("x1", 0) <= name_col_end + 2)
+                            ]
+                        else:
+                            base_start = (code_x1 if code_x1 is not None else code_x0 if code_x0 is not None else 0) + 2
+                            name_x0 = base_start
+                            name_x1 = base_start + 260
+                            name_words = [
+                                w
+                                for w in line_words
+                                if w.get("x0", 0) >= name_x0 - 1 and w.get("x1", 0) <= name_x1 + 4
+                            ]
+                            if not name_words:
+                                # Still keep the band so following lines can contribute.
+                                name_words = []
+
+                        if name_col is not None and not name_words:
+                            for look_ahead in lines[idx + 1 :]:
+                                look_text = clean(" ".join(w.get("text", "") for w in look_ahead))
+                                look_upper = look_text.upper()
+                                if not look_text:
+                                    continue
+                                if detect_panel_label(look_upper):
+                                    break
+                                if look_upper.startswith("NAME PLATE") or header_pat.match(look_upper):
+                                    break
+                                if code_pat.search(look_upper):
+                                    break
+                                column_words = [
+                                    w
+                                    for w in look_ahead
+                                    if w.get("x0", 0) >= name_col - 1
+                                    and (name_col_end is None or w.get("x1", 0) <= name_col_end + 2)
+                                ]
+                                if column_words:
+                                    name_words = column_words
+                                    name_x0 = min((w.get("x0", 0) for w in column_words), default=name_x0)
+                                    name_x1 = max((w.get("x1", 0) for w in column_words), default=name_x1)
+                                    break
+
                         name_part = clean(" ".join(w.get("text", "") for w in name_words))
                         pending = {
                             "code": code,
                             "name_parts": [],
                             "order": panel_order[current_label],
-                            "name_x0": threshold,
-                            "name_x1": name_col_end,
+                            "name_x0": name_x0 if name_x0 is not None else 0,
+                            "name_x1": name_x1,
                             "label": current_label,
                         }
                         panel_order[current_label] += 1
