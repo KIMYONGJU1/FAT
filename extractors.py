@@ -855,20 +855,49 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                             if code_norm and code_norm in word_norm:
                                 code_word = w
                                 break
-                        base_x = code_word.get("x1", code_word.get("x0", 0)) if code_word else None
-                        threshold = name_col if name_col is not None else None
-                        if threshold is None:
-                            threshold = (base_x or 0) + 4
-                        name_words = [w for w in line_words if w.get("x0", 0) >= threshold - 1]
-                        if name_col_end is not None:
-                            name_words = [w for w in name_words if w.get("x1", 0) <= name_col_end + 2]
+                        code_x0 = code_word.get("x0", 0) if code_word else None
+                        code_x1 = code_word.get("x1", 0) if code_word else None
+
+                        # Prefer header-derived name bounds. If unavailable, capture the text
+                        # to the RIGHT of the circuit code (standard GSP layout) and only fall
+                        # back to the left when no right-side words exist.
+                        name_words: List[Dict[str, Any]]
+                        name_x0 = name_col if name_col is not None else None
+                        name_x1 = name_col_end
+
+                        if name_col is not None:
+                            name_words = [
+                                w
+                                for w in line_words
+                                if w.get("x0", 0) >= name_col - 1
+                                and (name_col_end is None or w.get("x1", 0) <= name_col_end + 2)
+                            ]
+                        else:
+                            # GSP layout lists CIRCUIT NAME to the RIGHT of CIRCUIT NO. Prefer
+                            # right-side words; use the left only if the right side is empty.
+                            left_words = [
+                                w for w in line_words if code_x0 is None or w.get("x1", 0) <= code_x0 - 1
+                            ]
+                            right_words = [
+                                w for w in line_words if code_x1 is None or w.get("x0", 0) >= code_x1 + 1
+                            ]
+                            name_words = right_words if right_words else left_words
+                            if name_words:
+                                name_x0 = min((w.get("x0", 0) for w in name_words), default=name_x0)
+                                name_x1 = max((w.get("x1", 0) for w in name_words), default=name_x1)
+                            else:
+                                # fallback: treat everything after the code as the name region
+                                fallback_start = (code_x1 or code_x0 or 0) + 4
+                                name_words = [w for w in line_words if w.get("x0", 0) >= fallback_start - 1]
+                                name_x0 = fallback_start
+
                         name_part = clean(" ".join(w.get("text", "") for w in name_words))
                         pending = {
                             "code": code,
                             "name_parts": [],
                             "order": panel_order[current_label],
-                            "name_x0": threshold,
-                            "name_x1": name_col_end,
+                            "name_x0": name_x0 if name_x0 is not None else 0,
+                            "name_x1": name_x1,
                             "label": current_label,
                         }
                         panel_order[current_label] += 1
