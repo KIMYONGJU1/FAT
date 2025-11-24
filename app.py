@@ -375,11 +375,36 @@ class App(tk.Tk):
         ttk.Label(
             panel_wrap,
             text="ACB SETTING TABLE 페이지에서 추출된 패널 기본 정보를 확인/수정하세요.",
-        ).grid(row=0, column=0, sticky="w")
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
 
-        slots_grid = ttk.Frame(panel_wrap)
-        slots_grid.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        columns_count = max(1, min(2, len(self.panel_slot_defs) or 1))
+        # 스크롤 가능한 캔버스 추가
+        canvas = tk.Canvas(panel_wrap, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(panel_wrap, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        
+        # 캔버스 너비를 scrollable_frame에 맞춤
+        def _on_canvas_configure(event):
+            canvas.itemconfig(canvas_window, width=event.width)
+        
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        scrollbar.grid(row=1, column=1, sticky="ns", pady=(10, 0))
+
+        # 패널 그리드를 스크롤 가능한 프레임 안에 생성
+        slots_grid = ttk.Frame(scrollable_frame)
+        slots_grid.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        # 2열 레이아웃
+        columns_count = 2
         for col in range(columns_count):
             slots_grid.columnconfigure(col, weight=1)
 
@@ -389,6 +414,7 @@ class App(tk.Tk):
             col_idx = idx % columns_count
             frame.grid(row=row_idx, column=col_idx, sticky="nsew", padx=8, pady=8)
             frame.columnconfigure(1, weight=1)
+            
             vars_map = self.panel_slot_vars.setdefault(slot["slot"], {})
             for f_idx, field in enumerate(PANEL_VALUE_FIELDS):
                 label_text = PANEL_FIELD_LABELS.get(field, field)
@@ -399,11 +425,18 @@ class App(tk.Tk):
                     vars_map[field] = var
                 ttk.Entry(frame, textvariable=var).grid(row=f_idx, column=1, sticky="ew", pady=2)
 
+        # 마우스 휠 스크롤 지원
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
         ttk.Button(
             panel_wrap,
             text="적용(패널 정보 저장)",
             command=self._panel_apply_from_ui,
-        ).grid(row=2, column=0, sticky="e", pady=(10, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+
 
         gsp_wrap = ttk.Frame(self.page_gsp, padding=12)
         gsp_wrap.pack(fill="both", expand=True)
@@ -595,19 +628,24 @@ class App(tk.Tk):
             self.after(0, lambda: messagebox.showerror("오류", str(e)))
 
     # ---------- workers ----------
+   
     def _extract_worker(self):
         self.log("[INFO] Extract started.")
         msbd, gsp = self.msbd_path.get().strip(), self.gsp_path.get().strip()
         if not (os.path.isfile(msbd) and os.path.isfile(gsp)):
             self.after(0, lambda: messagebox.showerror("오류", "MSBD, GSP PDF를 모두 선택하세요."))
             return
-        ex.set_progress_cb(self._subprogress(10, 20)); cov_msbd = ex.parse_cover_info(msbd)
+        
+        ex.set_progress_cb(self._subprogress(10, 20))
+        cov_msbd = ex.parse_cover_info(msbd)
         cov_gsp = ex.parse_cover_info(gsp)
         merged_cover = merge_cover(cov_msbd, cov_gsp)
         self.hull_to_class = dict(merged_cover.get("hull_to_class", {}))
 
-        ex.set_progress_cb(self._subprogress(30, 15)); spec_msbd = ex.parse_general_spec(msbd)
-        ex.set_progress_cb(self._subprogress(45, 15)); spec_gsp = ex.parse_general_spec(gsp)
+        ex.set_progress_cb(self._subprogress(30, 15))
+        spec_msbd = ex.parse_general_spec(msbd)
+        ex.set_progress_cb(self._subprogress(45, 15))
+        spec_gsp = ex.parse_general_spec(gsp)
 
         hulls = sorted(self.hull_to_class.keys())
         
@@ -619,39 +657,54 @@ class App(tk.Tk):
                 self.selected_hull.set(hulls[0])
                 self._on_hull_change()
 
-            # Combine spec fields and fill Page-1 entries
+            # Combine spec fields
             fields = merged_cover["fields"]
             fields = combine_all(fields, spec_msbd)
             fields = combine_all(fields, spec_gsp)
 
-            # enforce IP fallback: always normalize to IP22 (per request)
+            # IP fallback
             for _k in ('ms_ip','gsp_ip'):
                 _v = (fields.get(_k) or '').strip().upper()
                 if _v != 'IP22':
                     fields[_k] = 'IP22'
 
-
-            # Parse panels & emergency
+            # Parse panels
             try:
                 ex.set_progress_cb(self._subprogress(60, 12))
                 self.panels_data = ex.parse_panel_blocks_v2(msbd, gsp) or []
             except Exception as e:
                 self.log(f"[WARN] 패널 파싱 실패: {e}")
                 self.panels_data = []
+            
+            # Parse GSP function
             try:
                 ex.set_progress_cb(self._subprogress(72, 8))
                 self.gsp_function_data = ex.parse_function_test_of_gsp(gsp) or []
             except Exception as e:
                 self.log(f"[WARN] GSP Function 파싱 실패: {e}")
                 self.gsp_function_data = []
+            
+            # Parse Emergency Stop
             try:
                 ex.set_progress_cb(self._subprogress(80, 10))
-                ems = ex.parse_emergency_stop(gsp)
+                
+                # 신규 범용 파서 사용
+                ems = ex.parse_emergency_stop_from_mccb(msbd)
+                
+                # MSBD 실패 시 GSP 시도
+                if not ems:
+                    ems = ex.parse_emergency_stop_from_mccb(gsp)
+                
+                # 둘 다 실패 시 기존 파서
                 if not ems:
                     ems = ex.parse_emergency_colorplate(msbd)
+                
                 self.em_stops_data = ems or []
+                
             except Exception as e:
                 self.log(f"[WARN] Emergency 파싱 실패: {e}")
+                import traceback
+                traceback.print_exc()
                 self.em_stops_data = []
 
             # Fill GENERAL SPEC entries
@@ -668,10 +721,13 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-            self.progress(100, "완료"); self.log("[OK] Extract finished.")
+            self.progress(100, "완료")
+            self.log("[OK] Extract finished.")
+        
         self.after(0, ui_fill)
 
-    def _validate_template_worker(self):
+    def _validate_template_worker(self): 
+
         tpl = self.template_path.get().strip()
         if not os.path.isfile(tpl):
             self.after(0, lambda: messagebox.showerror("오류", "템플릿 DOCX를 먼저 선택하세요."))

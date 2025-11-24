@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-FAT AutoFill Extractors (v2.0)
-- MSBD/GSP PDF에서 표지 & GENERAL SPEC 영역 특정 항목을 안정적으로 추출
-- Pure-Python: pdfplumber + regex 기반
+FAT AutoFill Extractors (v2.4.4 - Emergency Circuit REMARKS 집중)
+- REMARKS 컬럼에서 Emergency CODE 추출
+- MSBD/GSP NAME PLATE (MCCB) 페이지 정확히 파싱
+- Circuit 매칭 여부와 상관없이 모든 CODE 표시
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import os, re
 import pdfplumber
 
 # ------------------------
-# Progress Hook (non-breaking)
+# Progress Hook
 # ------------------------
 PROGRESS_CB = None
 
@@ -40,7 +41,6 @@ def read_page_text(pdf_path: str, page_index: int) -> str:
         pass
     return ""
 
-
 def read_text(pdf_path: str, max_pages: int = 20) -> str:
     out: List[str] = []
     try:
@@ -56,14 +56,11 @@ def read_text(pdf_path: str, max_pages: int = 20) -> str:
                 _notify_progress(int((i+1)*100/N), os.path.basename(pdf_path))
     except Exception:
         pass
-        pass
     return "\n".join(out)
-
 
 # ------------------------
 # Helpers
-
-# --- Added helpers: class/ip/tr capacity from NAME PLATE & text ---
+# ------------------------
 SN_BLOCK = re.compile(r'SN\d{4}(?:/\d{2})*')
 
 def _expand_sn_block(block: str) -> List[str]:
@@ -130,21 +127,17 @@ def extract_tr_capacity(msbd_text: str) -> Optional[str]:
         if (best_val or -1) < val and score >= 10:
             best_val = val
     if not best_val:
-        # fallback: largest kVA in doc
         nums = [int(x) for x in kva_pat.findall(msbd_text or '')]
         best_val = max(nums) if nums else None
     return f"{best_val} kVA" if best_val else None
 
-# ------------------------
 def find_hull_in_bottom_right(pdf_path: str) -> Optional[str]:
-    """Read page0 bottom-right quadrant to find SN#### explicitly on the cover footer area."""
     try:
         with pdfplumber.open(pdf_path) as pdf:
             if not pdf.pages: 
                 return None
             p0 = pdf.pages[0]
             w, h = p0.width, p0.height
-            # conservative bottom-right box (works for most title blocks)
             crop = (w*0.55, h*0.65, w*0.99, h*0.99)
             sub = p0.within_bbox(crop)
             txt = sub.extract_text() or ""
@@ -164,17 +157,42 @@ PANEL_SLOT_SPECS = [
     {
         "slot": "no1",
         "title": "No.1 INCOMING PANEL",
-        "aliases": ["NO1INCOMING", "NO1INCOMINGPANEL", "NO1MAININCOMING"],
+        # NO.1 / NO1 / NO.1&2 등 다양한 표기 대응
+        "aliases": [
+            "NO1INCOMING",
+            "NO1INCOMINGPANEL",
+            "NO1MAININCOMING",
+            "NO1",
+            "NO01",
+            "NO.1",
+            "NO12",           # "NO.1&2" → "NO12" 로 인식되는 경우
+        ],
     },
     {
         "slot": "no2",
         "title": "No.2 INCOMING PANEL",
-        "aliases": ["NO2INCOMING", "NO2INCOMINGPANEL", "NO2MAININCOMING"],
+        # NO.2 / NO2 / NO.1&2 등 다양한 표기 대응
+        "aliases": [
+            "NO2INCOMING",
+            "NO2INCOMINGPANEL",
+            "NO2MAININCOMING",
+            "NO2",
+            "NO02",
+            "NO.2",
+            "NO12",           # "NO.1&2" 공용 열인 경우 no1 / no2 둘 다 이 좌표 사용
+        ],
     },
     {
         "slot": "bus",
         "title": "BUS-TIE",
-        "aliases": ["BUSTIE", "BUSTIEPANEL", "BUSTIESWBD", "BUSTIESWITCHBOARD"],
+        # BUS TIE 가 두 단어로 나뉘는 케이스까지 고려
+        "aliases": [
+            "BUSTIE",
+            "BUSTIEPANEL",
+            "BUSTIESWBD",
+            "BUSTIESWITCHBOARD",
+            "BUS",            # "BUS TIE" 에서 BUS 단어만 잡히는 경우
+        ],
     },
     {
         "slot": "emg",
@@ -184,9 +202,12 @@ PANEL_SLOT_SPECS = [
             "EMERCYSWITCHBOARD",
             "LINKTOEMCYSWITCHBOARD",
             "LINKTOEMERGENCYSWITCHBOARD",
+            "EMCY",           # "EMCY SWITCHBOARD" 같은 표기 대응
+            "EMERGENCYSWBD",
         ],
     },
 ]
+
 
 PANEL_ROW_MARKERS = {
     "acb_type": [r"ACB\s*(TYPE|MODEL)", r"AIR\s+CIRCUIT\s+BREAKER"],
@@ -219,17 +240,11 @@ def find_rev_in_filename(path: str) -> Optional[str]:
     return None
 
 def parse_class_table(p0: str) -> Dict[str, str]:
-    """Parse CLASS table lines like:
-       SN2670/71/72/73/74/75  ABS
-       SN2676~2681            NK
-       SN2682/83/84/85        LR
-    Return mapping {'SN2670':'ABS', ...} (first match wins)."""
     result: Dict[str, str] = {}
     lines = [ln.strip() for ln in (p0 or "").splitlines() if ln.strip()]
     for i, ln in enumerate(lines):
         if "SN" not in ln.upper():
             continue
-        # find class token on this or next line
         cls = None
         for j in (i, i+1 if i+1 < len(lines) else i):
             m = re.search(r'\b(ABS|NK|LR|KR|DNV|BV|LRS|RINA)\b', lines[j], flags=re.IGNORECASE)
@@ -243,19 +258,17 @@ def parse_class_table(p0: str) -> Dict[str, str]:
             continue
         base = int(m.group(1)); tail = m.group(2)
         nums = {base}
-        # ~ range
         mrg = re.search(r'~\s*(\d{4})', tail)
         if mrg:
             end = int(mrg.group(1))
             lo, hi = sorted((base, end))
             for n in range(lo, hi+1):
                 nums.add(n)
-        # / list
         for tok in re.findall(r'/\s*(\d{2,4})', tail):
             n = int(tok) if len(tok)==4 else int(str(base)[:2]+tok)
             nums.add(n)
         for n in sorted(nums):
-            result.setdefault(f"SN{n}", cls)  # first match wins
+            result.setdefault(f"SN{n}", cls)
     return result
 
 def _median(values: List[float]) -> Optional[float]:
@@ -267,16 +280,38 @@ def _median(values: List[float]) -> Optional[float]:
         return float(ordered[mid])
     return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
 
-
 def _find_acb_setting_page(pdf) -> Tuple[Optional[int], Optional["pdfplumber.page.Page"]]:
+    """
+    ACB SETTING TABLE 페이지 찾기 (Contents 페이지 제외)
+    """
     for idx, page in enumerate(pdf.pages):
         text_u = (page.extract_text() or "").upper()
-        if "ACB" not in text_u or "SETTING" not in text_u:
+        
+        # Contents 페이지는 건너뛰기
+        if "TABLE OF CONTENTS" in text_u or "CONTENTS" in text_u:
             continue
-        if re.search(r"TABL[EI]|TABEL|TANLE|TABLE", text_u):
+        
+        # ACB 키워드 필수
+        if "ACB" not in text_u:
+            continue
+        
+        # 실제 테이블의 특징적인 키워드들
+        has_air_circuit_breaker = "AIR CIRCUIT BREAKER" in text_u
+        has_ampere_frame = "AMPERE FRAME" in text_u or "AMPERE" in text_u
+        has_rated_current = "RATED CURRENT" in text_u
+        
+        # 조건1: AIR CIRCUIT BREAKER + AMPERE FRAME (실제 테이블 페이지의 특징)
+        if has_air_circuit_breaker and has_ampere_frame:
+            print(f"[INFO] ACB SETTING TABLE 페이지 발견: Page {idx + 1}")
             return idx, page
+        
+        # 조건2: ACB + SETTING + 주요 테이블 키워드
+        if "SETTING" in text_u and has_ampere_frame and has_rated_current:
+            print(f"[INFO] ACB SETTING TABLE 페이지 발견: Page {idx + 1}")
+            return idx, page
+    
+    print("[WARN] ACB SETTING TABLE 페이지를 찾을 수 없습니다.")
     return None, None
-
 
 def _slot_ranges_from_words(words: List[Dict[str, Any]]) -> Dict[str, Tuple[float, float]]:
     hits: Dict[str, List[float]] = defaultdict(list)
@@ -306,7 +341,6 @@ def _slot_ranges_from_words(words: List[Dict[str, Any]]) -> Dict[str, Tuple[floa
         ranges[slot] = (left, right)
     return ranges
 
-
 def _row_positions_from_words(words: List[Dict[str, Any]]) -> Dict[str, float]:
     positions: Dict[str, float] = {}
     for field, patterns in PANEL_ROW_MARKERS.items():
@@ -321,7 +355,6 @@ def _row_positions_from_words(words: List[Dict[str, Any]]) -> Dict[str, float]:
         if med is not None:
             positions[field] = med
     return positions
-
 
 def _words_in_band(
     words: List[Dict[str, Any]], x0: float, x1: float, center_y: Optional[float], band: float = 18.0
@@ -338,7 +371,6 @@ def _words_in_band(
             result.append(w)
     return result
 
-
 def _numbers_from_words(words: List[Dict[str, Any]]) -> List[int]:
     numbers: List[int] = []
     for w in words:
@@ -349,7 +381,6 @@ def _numbers_from_words(words: List[Dict[str, Any]]) -> List[int]:
             except Exception:
                 continue
     return numbers
-
 
 def _blank_panel_records() -> List[Dict[str, str]]:
     records: List[Dict[str, str]] = []
@@ -368,84 +399,777 @@ def _blank_panel_records() -> List[Dict[str, str]]:
         )
     return records
 
+def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
+    """
+    페이지에서 채워진 체크박스(검은색 네모) 찾기
+    """
+    checkboxes = []
+    rects = page.rects or []
+    
+    for rect in rects:
+        width = rect.get("x1", 0) - rect.get("x0", 0)
+        height = rect.get("y1", 0) - rect.get("y0", 0)
+        
+        # 3~20px 크기의 사각형
+        if not (3 <= width <= 20 and 3 <= height <= 20):
+            continue
+        
+        # 검은색 체크 (fill color가 어두운지 확인)
+        fill = rect.get("non_stroking_color")
+        is_filled = False
+        
+        if fill is not None:
+            if isinstance(fill, (tuple, list)):
+                # RGB/CMYK: 평균이 0.25 이하면 검은색
+                is_filled = sum(fill) / len(fill) < 0.25
+            elif isinstance(fill, (int, float)):
+                # Grayscale: 0.25 이하면 검은색
+                is_filled = fill < 0.25
+        
+        if is_filled:
+            cx = (rect["x0"] + rect["x1"]) / 2.0
+            cy = (rect["top"] + rect["bottom"]) / 2.0
+            checkboxes.append({"x": cx, "y": cy})
+    
+    preview = ", ".join(f"({c['x']:.1f}, {c['y']:.1f})" for c in checkboxes[:5])
+    print(f"\n체크박스 좌표: {preview}")
+    return checkboxes
+
+def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
+    """
+    PANEL 헤더 텍스트와 체크박스 위치로 각 PANEL의 X축 범위 결정
+    """
+    words = page.extract_words() or []
+    panel_positions: Dict[str, float] = {}
+
+    # 1단계: PANEL_SLOT_SPECS 의 alias 로 헤더 위치 찾기
+    for spec in PANEL_SLOT_SPECS:
+        slot = spec["slot"]
+        aliases = spec.get("aliases", [])
+
+        for word in words:
+            text = (word.get("text") or "").strip().upper()
+            if not text:
+                continue
+            # 공백/기호 제거 후 비교
+            text_norm = re.sub(r"[^A-Z0-9]", "", text)
+
+            for alias in aliases:
+                if alias and alias in text_norm:
+                    cx = (word["x0"] + word["x1"]) / 2.0
+                    panel_positions[slot] = cx
+                    break
+
+            if slot in panel_positions:
+                break
+
+    # 1-보강: alias 로 BUS 를 못 찾았을 때 "BUS" + "TIE" 가 같은 줄에 있는지 검사
+    if "bus" not in panel_positions:
+        # y 기준으로 같은 줄에 있는 단어끼리 묶기
+        lines_by_y: Dict[float, List[dict]] = {}
+        for w in words:
+            y_center = round((w["top"] + w["bottom"]) / 2.0, 1)
+            lines_by_y.setdefault(y_center, []).append(w)
+
+        for line_words in lines_by_y.values():
+            texts = [(w.get("text") or "").strip().upper() for w in line_words]
+            if "BUS" in texts and "TIE" in texts:
+                xs = [
+                    (w["x0"] + w["x1"]) / 2.0
+                    for w in line_words
+                    if (w.get("text") or "").strip().upper() in ("BUS", "TIE")
+                ]
+                if xs:
+                    panel_positions["bus"] = sum(xs) / len(xs)
+                break
+
+    # 2단계: X축 범위 계산
+    sorted_panels = sorted(panel_positions.items(), key=lambda x: x[1])
+    panel_columns: Dict[str, Tuple[float, float]] = {}
+
+    for idx, (slot, center_x) in enumerate(sorted_panels):
+        # 왼쪽 경계
+        if idx > 0:
+            prev_x = sorted_panels[idx - 1][1]
+            x_min = (prev_x + center_x) / 2.0
+        else:
+            x_min = center_x - 100.0
+
+        # 오른쪽 경계
+        if idx < len(sorted_panels) - 1:
+            next_x = sorted_panels[idx + 1][1]
+            x_max = (center_x + next_x) / 2.0
+        else:
+            x_max = center_x + 100.0
+
+        panel_columns[slot] = (x_min, x_max)
+
+    return panel_columns
+
+
+def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
+    """
+    ACB TYPE 추출 (HGN 63, HGN 10 등) - HGN 시리즈 전용
+    OCR Type(GPR-SA)과 명확히 구분하여 추출
+    AIR CIRCUIT BREAKER 섹션에서만 HGN 시리즈 찾기
+    """
+    words = page.extract_words() or []
+    text = page.extract_text() or ""
+    text_upper = text.upper()
+    
+    # AIR CIRCUIT BREAKER 섹션 찾기 (ACB TYPE의 핵심 위치)
+    if "AIR CIRCUIT BREAKER" not in text_upper and "ACB TYPE" not in text_upper:
+        return ""
+    
+    # AIR CIRCUIT BREAKER 키워드의 Y 좌표 찾기
+    acb_section_y = None
+    for word in words:
+        word_text = (word.get("text") or "").strip().upper()
+        # "AIR CIRCUIT BREAKER" 또는 "ACB TYPE" 찾기
+        if ("AIR" in word_text and "CIRCUIT" in text_upper) or ("ACB" in word_text and "TYPE" in word_text):
+            acb_section_y = (word["top"] + word["bottom"]) / 2.0
+            break
+    
+    if not acb_section_y:
+        return ""
+    
+    # HGN 시리즈만 찾기 (GPR-SA는 OCR Type이므로 제외!)
+    hgn_pattern = re.compile(r'\bHGN\s*(\d{2})\b', re.I)
+    
+    hgn_candidates = []
+    for word in words:
+        wy = (word["top"] + word["bottom"]) / 2.0
+        wx = (word["x0"] + word["x1"]) / 2.0
+        
+        # AIR CIRCUIT BREAKER 섹션 아래 150px 이내만 확인
+        if not (0 < (wy - acb_section_y) < 150):
+            continue
+        
+        # 해당 PANEL 영역 내 (여유있게 확인)
+        if not (x_min - 30 <= wx <= x_max + 30):
+            continue
+        
+        word_text = (word.get("text") or "").strip()
+        match = hgn_pattern.search(word_text)
+        
+        if match:
+            hgn_type = f"HGN {match.group(1)}"
+            hgn_candidates.append({
+                'text': hgn_type,
+                'x': wx,
+                'y': wy
+            })
+    
+    if not hgn_candidates:
+        print(f"    [DEBUG] HGN 후보를 찾을 수 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
+        return ""
+    
+    print(f"    [DEBUG] HGN 후보: {[c['text'] for c in hgn_candidates]}")
+    
+    # 체크박스가 있으면 체크박스와 가장 가까운 HGN 선택
+    if checkboxes:
+        # ACB TYPE 행 근처의 체크박스 찾기 (범위 확대)
+        type_checkboxes = [
+            cb for cb in checkboxes 
+            if abs(cb['y'] - acb_section_y) < 100
+            and x_min - 30 <= cb['x'] <= x_max + 30
+        ]
+        
+        print(f"    [DEBUG] 체크박스: {len(type_checkboxes)}개")
+        
+        if type_checkboxes:
+            best_match = None
+            min_dist = float('inf')
+            
+            for cb in type_checkboxes:
+                for candidate in hgn_candidates:
+                    dist_x = abs(candidate['x'] - cb['x'])
+                    dist_y = abs(candidate['y'] - cb['y'])
+                    dist = (dist_x ** 2 + dist_y ** 2) ** 0.5
+                    
+                    # X축 거리가 80px 이내이고 전체 거리가 가장 가까운 것 선택
+                    if dist < min_dist and dist_x < 80:
+                        min_dist = dist
+                        best_match = candidate['text']
+            
+            if best_match:
+                print(f"    [DEBUG] 체크박스 기반 선택: {best_match}")
+                return best_match
+    
+    # 체크박스가 없거나 매칭 실패 시 첫 번째 HGN 후보 반환
+    print(f"    [DEBUG] 기본값 선택: {hgn_candidates[0]['text']}")
+    return hgn_candidates[0]['text']
+
+def _extract_ocr_type(page) -> str:
+    """
+    OCR TYPE 추출 (GPR-SA 등) - 범용성 개선
+    LONG TIME DELAY TRIP 섹션 또는 TYPE 행에서 찾기
+    """
+    words = page.extract_words() or []
+    text = page.extract_text() or ""
+    text_upper = text.upper()
+    
+    # 우선순위 1: LONG TIME DELAY TRIP 섹션의 TYPE
+    if "LONG TIME" in text_upper and "DELAY" in text_upper:
+        # LTD 섹션 시작 Y 좌표 찾기
+        ltd_y = None
+        for word in words:
+            word_text = (word.get("text") or "").strip().upper()
+            if "LONG" in word_text or ("DELAY" in word_text and "TRIP" in text_upper):
+                ltd_y = (word["top"] + word["bottom"]) / 2.0
+                break
+        
+        if ltd_y:
+            # LTD 섹션 내의 TYPE 찾기
+            for word in words:
+                wy = (word["top"] + word["bottom"]) / 2.0
+                
+                # LTD 섹션 이후 200px 이내
+                if not (0 < (wy - ltd_y) < 200):
+                    continue
+                
+                word_text = (word.get("text") or "").strip().upper()
+                if word_text == "TYPE":
+                    # TYPE 근처에서 GPR-SA 등 찾기
+                    type_y = wy
+                    
+                    for w2 in words:
+                        w2y = (w2["top"] + w2["bottom"]) / 2.0
+                        
+                        if abs(w2y - type_y) > 30:
+                            continue
+                        
+                        text2 = (w2.get("text") or "").strip().upper()
+                        
+                        # OCR 타입 패턴
+                        if re.match(r'GPR-[A-Z]{1,2}', text2):
+                            return text2
+                        if re.match(r'[A-Z]{2,4}-[A-Z0-9]{1,3}', text2):
+                            return text2
+    
+    # 우선순위 2: 페이지 전체에서 OCR 타입 패턴 찾기
+    ocr_patterns = [
+        re.compile(r'GPR-[A-Z]{1,2}', re.I),
+        re.compile(r'SOLID\s+STATE', re.I),
+    ]
+    
+    for pattern in ocr_patterns:
+        for word in words:
+            text = (word.get("text") or "").strip().upper()
+            if pattern.search(text):
+                return text
+    
+    # 우선순위 3: 여러 단어 조합 (예: "SOLID STATE TYPE")
+    text_lines = text.split('\n')
+    for line in text_lines:
+        if "TRIP" in line.upper() and "TYPE" in line.upper():
+            # R (UPR), SOLID STATE 등 추출
+            match = re.search(r'([A-Z]{2,10}(?:\s+[A-Z]{2,10})?)\s*TYPE', line.upper())
+            if match:
+                ocr_type = match.group(1).strip()
+                if len(ocr_type) > 2:  # 의미있는 길이
+                    return ocr_type
+    
+    return ""
+
+def _extract_checked_value(
+    page, 
+    x_min: float, 
+    x_max: float, 
+    checkboxes: List[Dict[str, float]], 
+    row_keyword1: str,
+    row_keyword2: str = "",
+    value_type: str = "integer"
+) -> str:
+    """
+    특정 행에서 체크박스가 있는 값 추출 (개선 버전)
+    """
+    words = page.extract_words() or []
+    text_upper = (page.extract_text() or "").upper()
+    
+    # 행 키워드 찾기
+    if row_keyword1 not in text_upper:
+        return ""
+    
+    # 행의 Y 좌표 찾기 (더 유연하게)
+    row_y = None
+    for word in words:
+        text = (word.get("text") or "").strip().upper()
+        if row_keyword1 in text or (row_keyword2 and row_keyword2 in text):
+            row_y = (word["top"] + word["bottom"]) / 2.0
+            break
+    
+    if row_y is None:
+        return ""
+    
+    # 해당 행에서 체크박스 찾기 (범위 확대: 30 → 50)
+    row_checkboxes = [cb for cb in checkboxes if abs(cb["y"] - row_y) < 50]
+    
+    # 해당 PANEL 영역의 체크박스만 필터링
+    panel_checkboxes = [cb for cb in row_checkboxes if x_min <= cb["x"] <= x_max]
+    
+    if not panel_checkboxes:
+        return ""
+    
+    # 모든 체크박스 근처의 값 수집 (첫 번째만이 아닌 전부)
+    candidates = []
+    for cb in panel_checkboxes:
+        for word in words:
+            wx = (word["x0"] + word["x1"]) / 2.0
+            wy = (word["top"] + word["bottom"]) / 2.0
+            
+            # 체크박스와 같은 행인지 확인 (범위 확대: 15 → 25)
+            if abs(wy - cb["y"]) > 25:
+                continue
+            
+            # X축이 가까운지 확인 (범위 확대: 50 → 80)
+            if abs(wx - cb["x"]) > 80:
+                continue
+            
+            text = (word.get("text") or "").strip()
+            
+            # 값 형식 검증
+            if value_type == "integer":
+                # 숫자만 (800A, 5000A, 5000 등)
+                if re.match(r'^\d+A?$', text):
+                    num_value = re.sub(r'A$', '', text)
+                    candidates.append(int(num_value))
+            elif value_type == "decimal":
+                # 소수 (0.7, 1.0, 1 등)
+                if re.match(r'^\d+\.?\d*$', text):
+                    candidates.append(float(text))
+    
+    # 가장 큰 값 반환 (일반적으로 올바른 값이 더 큼)
+    if candidates:
+        if value_type == "integer":
+            return str(max(candidates))
+        elif value_type == "decimal":
+            return str(max(candidates))
+    
+    return ""
+
+def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
+    """
+    AMPERE FRAME 값 추출 (800, 1000, 6300 등) - 범용성 및 정확도 개선
+    PANEL 영역 내의 값만 추출, 체크박스 우선
+    """
+    words = page.extract_words() or []
+    text_upper = (page.extract_text() or "").upper()
+    
+    # AMPERE FRAME 행 찾기
+    if "AMPERE" not in text_upper or "FRAME" not in text_upper:
+        return ""
+    
+    # AMPERE FRAME 키워드의 Y 좌표 찾기
+    frame_y = None
+    for word in words:
+        text = (word.get("text") or "").strip().upper()
+        if "AMPERE" in text or "FRAME" in text:
+            frame_y = (word["top"] + word["bottom"]) / 2.0
+            break
+    
+    if not frame_y:
+        return ""
+    
+    # 프레임 값 후보들 수집 (AMPERE FRAME 행 아래, PANEL 영역 내)
+    frame_values = []
+    for word in words:
+        wy = (word["top"] + word["bottom"]) / 2.0
+        wx = (word["x0"] + word["x1"]) / 2.0
+        
+        # AMPERE FRAME 행 아래 200px 이내
+        if not (0 < (wy - frame_y) < 200):
+            continue
+        
+        # PANEL 영역 내 (여유 있게)
+        if not (x_min - 50 <= wx <= x_max + 50):
+            continue
+        
+        text = (word.get("text") or "").strip()
+        
+        # 숫자+A 패턴 (더 넓은 범위)
+        match = re.match(r'^(\d{3,5})A?$', text)
+        if match:
+            num = int(match.group(1))
+            # 600 ~ 10000까지 허용 (1000A도 포함)
+            if 600 <= num <= 10000:
+                frame_values.append({
+                    'value': num,
+                    'x': wx,
+                    'y': wy
+                })
+    
+    if not frame_values:
+        print(f"    [DEBUG] AMPERE FRAME 후보 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
+        return ""
+    
+    print(f"    [DEBUG] AMPERE FRAME 후보: {[fv['value'] for fv in frame_values]}")
+    
+    # 체크박스가 있는 값 찾기 (우선순위 1)
+    if checkboxes:
+        checked_values = []
+        
+        for fv in frame_values:
+            nearby_checkboxes = [
+                cb for cb in checkboxes
+                if abs(cb['y'] - fv['y']) < 40  # 같은 행 (범위 확대)
+                and abs(cb['x'] - fv['x']) < 100  # X축 거리
+                and x_min - 50 <= cb['x'] <= x_max + 50  # PANEL 영역
+            ]
+            
+            if nearby_checkboxes:
+                checked_values.append(fv['value'])
+        
+        if checked_values:
+            result = str(max(checked_values))
+            print(f"    [DEBUG] 체크박스 기반 선택: {result}")
+            return result
+    
+    # 체크박스 없으면 PANEL 영역의 가장 적절한 값 (우선순위 2)
+    panel_values = [fv['value'] for fv in frame_values if x_min - 30 <= fv['x'] <= x_max + 30]
+    
+    if panel_values:
+        # 여러 후보 중 중간값 선택 (노이즈 제거)
+        panel_values_sorted = sorted(panel_values)
+        result = str(panel_values_sorted[len(panel_values_sorted) // 2])
+        print(f"    [DEBUG] PANEL 영역 기반 선택: {result}")
+        return result
+    
+    print(f"    [DEBUG] AMPERE FRAME 추출 실패")
+    return ""
+
+def _extract_rated_current(page, x_min: float, x_max: float) -> str:
+    """
+    RATED CURRENT(Io) 값 추출 (5774A, 1000A 등) - 범용성 및 정확도 개선
+    PANEL 영역 내의 값만 추출
+    """
+    words = page.extract_words() or []
+    text_upper = (page.extract_text() or "").upper()
+    
+    # RATED CURRENT 행 찾기 (여러 표현)
+    rated_keywords = ["RATED CURRENT", "RATED", "CURRENT(IO)", "CURRENT (IO)", "IN(A)", "CURRENT"]
+    
+    rated_y = None
+    for keyword in rated_keywords:
+        if keyword in text_upper:
+            for word in words:
+                text = (word.get("text") or "").strip().upper()
+                if keyword in text or any(k in text for k in keyword.split()):
+                    rated_y = (word["top"] + word["bottom"]) / 2.0
+                    break
+            if rated_y:
+                break
+    
+    if not rated_y:
+        return ""
+    
+    # 해당 행 및 아래 행에서 PANEL 영역의 값 찾기
+    candidates = []
+    for word in words:
+        wx = (word["x0"] + word["x1"]) / 2.0
+        wy = (word["top"] + word["bottom"]) / 2.0
+        
+        # 같은 행 또는 바로 아래 100px 이내 (범위 확대)
+        if not (0 <= (wy - rated_y) <= 100):
+            continue
+        
+        # PANEL 영역 확인 (여유 있게)
+        if not (x_min - 50 <= wx <= x_max + 50):
+            continue
+        
+        text = (word.get("text") or "").strip()
+        
+        # 숫자+A 패턴
+        match = re.match(r'^(\d{3,5})A?$', text)
+        if match:
+            num = int(match.group(1))
+            # Rated Current 범위: 100~10000 (1000A도 포함)
+            if 100 <= num <= 10000:
+                candidates.append({
+                    'value': num,
+                    'x': wx,
+                    'y': wy
+                })
+    
+    if not candidates:
+        print(f"    [DEBUG] RATED CURRENT 후보 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
+        return ""
+    
+    print(f"    [DEBUG] RATED CURRENT 후보: {[c['value'] for c in candidates]}")
+    
+    # PANEL 중심 영역에 가장 가까운 값 선택
+    panel_center = (x_min + x_max) / 2.0
+    best_value = None
+    min_dist = float('inf')
+    
+    for candidate in candidates:
+        # PANEL 영역 내에 있는지 확인 (타이트하게)
+        if x_min - 30 <= candidate['x'] <= x_max + 30:
+            dist = abs(candidate['x'] - panel_center)
+            if dist < min_dist:
+                min_dist = dist
+                best_value = candidate['value']
+    
+    if best_value:
+        print(f"    [DEBUG] PANEL 중심 기반 선택: {best_value}")
+        return str(best_value)
+    
+    # 후보가 없으면 가장 큰 값 (fallback)
+    values = [c['value'] for c in candidates]
+    if values:
+        result = str(max(values))
+        print(f"    [DEBUG] Fallback 선택 (최대값): {result}")
+        return result
+    
+    print(f"    [DEBUG] RATED CURRENT 추출 실패")
+    return ""
 
 def extract_acb_setting_panels(msbd_pdf: str) -> List[Dict[str, str]]:
+    """
+    ACB SETTING TABLE에서 체크박스 기반으로 PANEL 정보 추출
+    """
     base_records = _blank_panel_records()
     if not (msbd_pdf and os.path.exists(msbd_pdf)):
         return base_records
+
     try:
         with pdfplumber.open(msbd_pdf) as pdf:
             _, page = _find_acb_setting_page(pdf)
             if page is None:
+                print("[WARN] ACB SETTING TABLE 페이지를 찾을 수 없습니다.")
                 return base_records
-            words = page.extract_words() or []
-            slot_ranges = _slot_ranges_from_words(words)
-            row_positions = _row_positions_from_words(words)
+
+            print(f"\n{'=' * 60}")
+            print("ACB SETTING TABLE 파싱 시작")
+            print(f"{'=' * 60}\n")
+
+            # 1단계: 체크박스 찾기
+            checkboxes = _find_filled_checkboxes(page)
+            print(f"\n체크박스 좌표: {[f'({c[\"x\"]:.1f}, {c[\"y\"]:.1f})' for c in checkboxes[:5]]}")
+            print(f"[STEP 1] 체크박스 감지: {len(checkboxes)}개 발견")
+
+            # 2단계: PANEL 컬럼 영역 결정
+            panel_columns = _determine_panel_columns(page, checkboxes)
+            print(f"[STEP 2] PANEL 컬럼 매핑:")
+            for slot, (x_min, x_max) in panel_columns.items():
+                print(f"  • {slot:10s} → X: {x_min:.1f} ~ {x_max:.1f}")
+
+            # 3단계: 행별 정보 추출
             record_map = {rec["slot"]: rec for rec in base_records}
-            for spec in PANEL_SLOT_SPECS:
-                record = record_map.get(spec["slot"])
-                bounds = slot_ranges.get(spec["slot"])
-                if not record or not bounds:
+
+            # TYPE 추출 (GPR-SA 등, 모든 PANEL 공통)
+            type_value = _extract_type_value(page)
+            print(f"\n[STEP 3] TYPE 추출: {type_value}")
+
+            # 각 PANEL별로 체크박스가 있는 항목 추출
+            for slot, (x_min, x_max) in panel_columns.items():
+                record = record_map.get(slot)
+                if not record:
                     continue
-                x0, x1 = bounds
-                # ACB TYPE
-                y = row_positions.get("acb_type")
-                if y is not None:
-                    texts = [
-                        (w.get("text") or "").strip().upper()
-                        for w in _words_in_band(words, x0, x1, y, band=18.0)
-                        if (w.get("text") or "").strip()
-                    ]
-                    picks = [t for t in texts if re.match(r"[A-Z]{2,}[0-9][A-Z0-9\-]*$", t)]
-                    if picks:
-                        record["acb_type"] = picks[0]
 
-                # OCR TYPE
-                y = row_positions.get("ocr_type")
-                if y is not None:
-                    texts = [
-                        (w.get("text") or "").strip().upper()
-                        for w in _words_in_band(words, x0, x1, y, band=18.0)
-                        if (w.get("text") or "").strip()
-                    ]
-                    picks = [t for t in texts if re.match(r"[A-Z]{2,}[0-9]{0,3}[A-Z]?$", t)]
-                    if picks:
-                        record["ocr_type"] = picks[0]
+                print(f"\n[{slot}] 추출 중...")
 
-                # AMPERE FRAME
-                y = row_positions.get("ampere_frame")
-                if y is not None:
-                    nums = [n for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0)) if n >= 400]
-                    if nums:
-                        record["ampere_frame"] = str(max(nums))
+                # TYPE (ACB Type) 공통 적용
+                if type_value:
+                    record["acb_type"] = type_value
 
-                # RATED CURRENT IN
-                y = row_positions.get("rated_current_in")
-                if y is not None:
-                    nums = _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0))
-                    if nums:
-                        record["rated_current_in"] = str(max(nums))
+                # OCR TYPE 추출
+                ocr = _extract_ocr_type(page, x_min, x_max, checkboxes)
+                if ocr:
+                    record["ocr_type"] = ocr
+                    print(f"  OCR Type: {ocr}")
 
-                # IR (%)
-                y = row_positions.get("ir_percent")
-                if y is not None:
-                    nums = [
-                        n
-                        for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0))
-                        if 10 <= n <= 150
-                    ]
-                    if nums:
-                        record["ir_percent"] = str(max(nums))
+                # AMPERE FRAME 추출 (체크박스 기반)
+                frame = _extract_checked_value(
+                    page, x_min, x_max, checkboxes, "AMPERE FRAME", "FRAME"
+                )
+                if frame:
+                    record["ampere_frame"] = frame
+                    print(f"  Ampere Frame: {frame}")
 
-                # IR (A)
-                y = row_positions.get("ir_amps")
-                if y is not None:
-                    nums = [n for n in _numbers_from_words(_words_in_band(words, x0, x1, y, band=20.0)) if n >= 100]
-                    if nums:
-                        record["ir_amps"] = str(max(nums))
+                # RATED CURRENT 추출
+                rated = _extract_rated_current(page, x_min, x_max)
+                if rated:
+                    record["rated_current_in"] = rated
+                    print(f"  Rated Current: {rated}")
+
+                # IR (%) 추출 (RANGE 행에서 체크박스 기반)
+                ir_pct = _extract_checked_value(
+                    page,
+                    x_min,
+                    x_max,
+                    checkboxes,
+                    "PICK UP",
+                    "RANGE",
+                    value_type="decimal",
+                )
+                if ir_pct:
+                    record["ir_percent"] = ir_pct
+                    print(f"  IR (%): {ir_pct}")
+
+                # IR (A) 계산 (rated_current * ir_percent)
+                if record["rated_current_in"] and record["ir_percent"]:
+                    try:
+                        rated_val = float(
+                            re.sub(r"[^0-9.]", "", record["rated_current_in"])
+                        )
+                        ir_pct_val = float(record["ir_percent"])
+                        ir_amps = int(rated_val * ir_pct_val)
+                        record["ir_amps"] = str(ir_amps)
+                        print(f"  IR (A): {ir_amps}")
+                    except Exception:
+                        pass
+
+            # --- BUS-TIE Fallback: BUS 패널이 비어 있으면 INCOMING 값 복사 ---
+            def _is_panel_empty(rec: Optional[Dict[str, str]]) -> bool:
+                if not rec:
+                    return True
+                for key in (
+                    "acb_type",
+                    "ocr_type",
+                    "ampere_frame",
+                    "rated_current_in",
+                    "ir_percent",
+                    "ir_amps",
+                ):
+                    if rec.get(key):
+                        return False
+                return True
+
+            bus_rec = record_map.get("bus")
+            no1_rec = record_map.get("no1")
+            no2_rec = record_map.get("no2")
+
+            if _is_panel_empty(bus_rec):
+                # 우선 no2, 그다음 no1 값 사용
+                src = None
+                if not _is_panel_empty(no2_rec):
+                    src = no2_rec
+                elif not _is_panel_empty(no1_rec):
+                    src = no1_rec
+
+                if src and bus_rec is not None:
+                    print(
+                        "\n[BUS] BUS-TIE 정보가 없어 INCOMING 패널 값으로 자동 채웁니다."
+                    )
+                    for key in (
+                        "acb_type",
+                        "ocr_type",
+                        "ampere_frame",
+                        "rated_current_in",
+                        "ir_percent",
+                        "ir_amps",
+                    ):
+                        if src.get(key):
+                            bus_rec[key] = src[key]
+
+            print(f"\n{'=' * 60}")
+            print("ACB SETTING TABLE 파싱 완료")
+            print(f"{'=' * 60}\n")
+
+            return base_records
+
+    except Exception as e:
+        print(f"[ERROR] ACB SETTING TABLE 파싱 실패: {e}")
+        import traceback
+
+        traceback.print_exc()
         return base_records
-    except Exception:
-        return base_records
+
+
+def _extract_ir_percent(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
+    """
+    IR (%) 추출 - LONG TIME DELAY TRIP (LTD) 섹션의 RANGE - 범용성 개선
+    Ir = In x set. 또는 Ir = Io x set. 근처
+    """
+    words = page.extract_words() or []
+    text_upper = (page.extract_text() or "").upper()
+    
+    # LONG TIME DELAY TRIP 섹션 찾기
+    if "LONG TIME" not in text_upper:
+        return ""
+    
+    # LTD 섹션 시작 Y 찾기
+    ltd_y = None
+    for word in words:
+        text = (word.get("text") or "").strip().upper()
+        if "LONG" in text or ("DELAY" in text and "TRIP" in text_upper):
+            ltd_y = (word["top"] + word["bottom"]) / 2.0
+            break
+    
+    if not ltd_y:
+        return ""
+    
+    # "PICK UP CURRENT" 또는 "Ir" 찾기 (LTD 섹션 내)
+    pickup_y = None
+    for word in words:
+        wy = (word["top"] + word["bottom"]) / 2.0
+        
+        # LTD 섹션 이후 200px 이내
+        if not (0 < (wy - ltd_y) < 200):
+            continue
+        
+        text = (word.get("text") or "").strip().upper()
+        
+        # "PICK UP", "Ir =", "Ir=" 등
+        if "PICK" in text or "IR" in text or "UP" in text:
+            pickup_y = wy
+            break
+    
+    if not pickup_y:
+        return ""
+    
+    # RANGE 키워드 찾기 (PICK UP 근처)
+    range_y = None
+    for word in words:
+        wy = (word["top"] + word["bottom"]) / 2.0
+        
+        # PICK UP 이후 100px 이내
+        if not (0 < (wy - pickup_y) < 100):
+            continue
+        
+        text = (word.get("text") or "").strip().upper()
+        if text == "RANGE":
+            range_y = wy
+            break
+    
+    if not range_y:
+        # RANGE 키워드 없으면 PICK UP 바로 아래 체크박스 찾기
+        range_y = pickup_y + 30
+    
+    # RANGE 행의 체크박스 찾기 (넓은 범위)
+    range_checkboxes = [
+        cb for cb in checkboxes 
+        if abs(cb['y'] - range_y) < 50
+        and x_min - 30 <= cb['x'] <= x_max + 30
+    ]
+    
+    if not range_checkboxes:
+        return ""
+    
+    # 체크박스 근처의 IR% 값 찾기
+    for cb in range_checkboxes:
+        for word in words:
+            wx = (word["x0"] + word["x1"]) / 2.0
+            wy = (word["top"] + word["bottom"]) / 2.0
+            
+            # 같은 행, 가까운 거리
+            if abs(wy - cb['y']) > 30 or abs(wx - cb['x']) > 100:
+                continue
+            
+            text = (word.get("text") or "").strip()
+            
+            # 소수값 패턴 (0.7, 0.8, 1.0, 1.15 등)
+            if re.match(r'^[01]\.?\d{0,2}$', text):
+                try:
+                    val = float(text)
+                    # IR% 범위: 0.5 ~ 1.5
+                    if 0.5 <= val <= 1.5:
+                        return str(val)
+                except:
+                    pass
+    
+    return ""
 
 # ------------------------
 # Cover Parser
@@ -456,7 +1180,6 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
     data: Dict[str, object] = {"fields": {}, "hull_to_class": {}, "titles": []}
     fields: Dict[str, str] = {}
 
-    # Common
     if "SAMSUNG HEAVY INDUSTRIES" in P0U:
         fields["customer"] = "SAMSUNG HEAVY INDUSTRIES"
     hv = find_hull_in_bottom_right(pdf_path)
@@ -466,15 +1189,13 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
     if hv:
         fields["hull_no"] = hv
 
-    # Item title
     if "GROUP STARTER PANEL" in P0U or "GSP" in P0U:
         data["titles"].append("GROUP STARTER PANEL")
     if "SWITCHBOARD" in P0U:
         data["titles"].append("AC440V LV SWITCHBOARD")
     if data["titles"]:
-        fields["item"] = " & ".join(dict.fromkeys(data["titles"]))  # dedup while preserving order
+        fields["item"] = " & ".join(dict.fromkeys(data["titles"]))
 
-    # DWG No (best-effort on cover)
     m = re.search(r'(?:DWG|DRAWING)\s*NO\.?[\s:\-]*([A-Z]{2,5}SE-\d{4,6})', p0, flags=re.IGNORECASE)
     if m:
         dwg = m.group(1).upper()
@@ -484,7 +1205,6 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
         else:
             fields["ms_dwg_no"] = dwg
     else:
-        # DWG fallback across full doc
         T_all = read_text(pdf_path, max_pages=6)
         m2 = re.search(r'([A-Z]{2,5}SE-\d{4,6})', T_all)
         if m2:
@@ -495,7 +1215,6 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
             else:
                 fields.setdefault("ms_dwg_no", dwg)
 
-    # REV (cover first → filename fallback)
     rev = find_rev_in_cover(p0) or find_rev_in_filename(pdf_path)
     if rev:
         bad = {'I','IE','IEW','IEWE','IEWED'}
@@ -510,7 +1229,6 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
         else:
             fields["ms_rev_no"] = rev
 
-    # Owner / Kind of Vessel (best-effort)
     m = re.search(r'\bOWNER\b\s*[:\-]?\s*([A-Z0-9 ]{2,})', p0, flags=re.IGNORECASE)
     if m:
         fields["owner"] = clean_num(m.group(1))
@@ -519,7 +1237,6 @@ def parse_cover_info(pdf_path: str) -> Dict[str, object]:
     if "CONTAINER VESSEL" in P0U:
         fields["Kind_of_Vessel"] = "16,500TEU CONTAINER VESSEL"
 
-    # Class mapping from CLASS table
     data["hull_to_class"] = parse_class_table(p0)
     data["fields"] = fields
     return data
@@ -533,11 +1250,9 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
     U = T.upper()
     out: Dict[str, str] = {}
 
-    msbd_text = T  # raw text
-    gsp_text = T  # if needed, same source; in UI we pass GSP separately when available
+    msbd_text = T
+    gsp_text = T
 
-
-    # Fault Level block
     m = re.search(r'SHORT\s*CIRCUIT\s*FAULT\s*LEVEL[\s\S]{0,800}', T, flags=re.IGNORECASE)
     block = m.group(0) if m else ""
     if block:
@@ -559,7 +1274,6 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
                 p440, p110 = last_two_floats(peak_row)
         if None not in (r440, r110, p440, p110):
             out["ms_fault_level"] = f"AC440V: {r440:.2f}/{p440:.2f} kA, AC110V: {r110:.2f}/{p110:.2f} kA"
-    # Fallback scan for rms/peak anywhere
     if "ms_fault_level" not in out:
         rms_line = re.search(r'Sym\.?\s*rms[^\n]{0,120}', T, flags=re.IGNORECASE)
         peak_line = re.search(r'Asym\.?\s*peak[^\n]{0,120}', T, flags=re.IGNORECASE)
@@ -573,7 +1287,6 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
         if None not in (r440, r110, p440, p110):
             out["ms_fault_level"] = f"AC440V: {r440:.2f}/{p440:.2f} kA, AC110V: {r110:.2f}/{p110:.2f} kA"
 
-    # OUTSIDE Munsell
     m = re.search(r'PAINT\s*COLOR[\s\S]{0,400}', T, flags=re.IGNORECASE)
     scope = m.group(0) if m else T
     outside_line = next((ln for ln in scope.splitlines() if "OUTSIDE" in ln.upper()), "")
@@ -585,40 +1298,32 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
             out["gsp_munsell_code"] = code
             out["gsp_paint"] = code
 
-    # GSP quantity
     q = re.search(r'QUANT(?:ITY|\.)\s*[:\-]?\s*(\d+)\s*SET\s*(?:\(\s*(\d+)\s*PNL\s*\))?', T, flags=re.IGNORECASE) \
-        or re.search(r"Q[’'\s]?TY\s*[:\-]?\s*(\d+)\s*SET(?:\s*\(\s*(\d+)\s*PNL\s*\))?", T, flags=re.IGNORECASE)
+        or re.search(r"Q['''\s]?TY\s*[:\-]?\s*(\d+)\s*SET(?:\s*\(\s*(\d+)\s*PNL\s*\))?", T, flags=re.IGNORECASE)
     if q:
         set_n, pnl_n = q.group(1), q.group(2)
         out["gsp_quantity"] = f"{set_n} SET" + (f" ( {pnl_n} PNL )" if pnl_n else "")
 
-    # MSBD quantity (from general spec / cover summary)
     if "GSP" not in os.path.basename(pdf_path).upper():
         q2 = re.search(r'QUANT(?:ITY|\.)\s*[:\-]?\s*(\d+)\s*SET\s*(?:\(\s*(\d+)\s*PNL\s*\))?', T, flags=re.IGNORECASE)
         if q2:
             set_n, pnl_n = q2.group(1), q2.group(2)
             out["ms_quantity"] = f"{set_n} SET" + (f" ( {pnl_n} PNL )" if pnl_n else "")
 
-    # Basic numeric specs (best-effort)
-    # Current and Main Bus
     m = re.search(r'RATED\s*CURRENT.*?(\d{3,6})\s*A', U, flags=re.IGNORECASE)
     if m: out.setdefault("ms_current", m.group(1) + "A")
     m = re.search(r'MAIN\s*BUS.*?(\d{3,6})\s*A', U, flags=re.IGNORECASE)
     if m: out.setdefault("ms_main_bus", m.group(1) + "A")
 
-    # TR capacity
     m = re.search(r'(?:TRANSFORMER\s*RATING|TR\s*CAP(?:ACITY)?)\D{0,40}(\d{3,5})\s*kVA', U, flags=re.IGNORECASE)
     if m: out.setdefault("ms_tr_capacity", f"{m.group(1)} kVA")
 
-    # Rating
     if "AC 440V" in U and "60HZ" in U and ("3W" in U or "3Φ" in U or "3PH" in U):
         out.setdefault("ms_rating", "AC 440V 60Hz 3Φ 3W")
 
-    # IP
     m = re.search(r'\bIP\s*2[12]\b', U)
     if m: out.setdefault("ms_ip", m.group(0).replace(" ", ""))
 
-    # fallback: if GSP doc but gsp_munsell_code missing, copy ms_munsell_code
     if "GSP" in os.path.basename(pdf_path).upper() and "gsp_munsell_code" not in out and "ms_munsell_code" in out:
         out["gsp_munsell_code"] = out["ms_munsell_code"]
     if ip_checked:
@@ -626,7 +1331,6 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
             out['gsp_ip'] = ip_checked
         else:
             out['ms_ip'] = ip_checked
-    # === post-processing from NAME PLATE/GENERAL SPEC ===
     try:
         cap = extract_tr_capacity(msbd_text)
         if cap:
@@ -641,7 +1345,6 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
             out['gsp_ip'] = gsp_ip
     except Exception:
         pass
-    # class from NAME PLATE (OTHER)
     try:
         hull = out.get('hull_no') or ''
         cls_guess = guess_class_from_nameplate_other(msbd_text, hull)
@@ -651,8 +1354,6 @@ def parse_general_spec(pdf_path: str) -> Dict[str, str]:
         pass
     return out
 
-
-# ---- Checkbox-based IP detection ----
 def detect_checked_ip(pdf_path: str) -> str | None:
     try:
         import pdfplumber, os, re
@@ -663,12 +1364,10 @@ def detect_checked_ip(pdf_path: str) -> str | None:
                 txt = (page.extract_text() or "").upper()
                 if "DEGREE OF PROTECTION" not in txt:
                     continue
-                # Text-glyph fallback (■/☑ before IPxx)
-                if re.search(r"(■|☑|●)\s*IP\s*22", txt): return "IP22"
-                if re.search(r"(■|☑|●)\s*IP\s*44", txt): return "IP44"
+                if re.search(r"(■|☑|◼)\s*IP\s*22", txt): return "IP22"
+                if re.search(r"(■|☑|◼)\s*IP\s*44", txt): return "IP44"
                 words = page.extract_words(use_text_flow=True) or []
                 rects = page.rects or []
-                # map candidates
                 ips = [w for w in words if w.get("text","").upper().replace(" ","") in ("IP22","IP44","IP23","IP54","IP55")]
                 for w in ips:
                     cy = (w["top"] + w["bottom"]) / 2.0
@@ -676,7 +1375,6 @@ def detect_checked_ip(pdf_path: str) -> str | None:
                     right_limit = w["x0"] - 40
                     if right_limit > left_limit:
                         left_limit, right_limit = right_limit, left_limit
-                    # find small filled rects just left of the label
                     cands = []
                     for r in rects:
                         width = r["x1"] - r["x0"]
@@ -699,360 +1397,180 @@ def detect_checked_ip(pdf_path: str) -> str | None:
     except Exception:
         return None
 
-
 def parse_panel_blocks_v2(msbd_pdf: str, gsp_pdf: str) -> List[Dict[str, object]]:
     _notify_progress(40, "PANELS:MSBD")
     records = extract_acb_setting_panels(msbd_pdf) or []
     return records
 
-
 def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
     if not (pdf_path and os.path.exists(pdf_path)):
         return []
 
-    code_pat = re.compile(r'P3[12]-\d{3}-\d{2}-PN', re.I)
-    header_pat = re.compile(
-        r'^(CIRCUIT\s+NAME|CIR\.?\s*NO|TYPE|MAT\'|RATING|MOTOR|SELECTING|SWITCH|LOAD|CONTROL|AMMETER|VOLTMETER|FREQUENCY|REMARK|NOTE|RESULT|STATUS|TEST|FRAME|CAPACITY|WIRING|WIRE|PANEL|POWER|MODEL|SPEC|SIZE|DATE|UNIT)',
-        re.I,
-    )
-
-    def circuit_sort_key(code: str) -> Tuple[int, int, int, str]:
-        pattern = re.compile(r'P(\d+)-(\d+)-(\d+)-([A-Z]+)', re.I)
-        m = pattern.match(code or "")
-        if m:
-            return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4).upper())
-        return (9999, 9999, 9999, (code or "").upper())
-
-    def clean(text: str) -> str:
-        text = re.sub(r'\s+', ' ', text or '')
-        return text.strip(" :-·•")
-
-    def group_words(words: List[Dict[str, Any]], y_tol: float = 2.5) -> List[List[Dict[str, Any]]]:
-        lines: List[Dict[str, Any]] = []
-        for w in sorted(words, key=lambda w: (w.get("top", 0), w.get("x0", 0))):
-            mid = (w.get("top", 0) + w.get("bottom", 0)) / 2.0
-            if not lines or abs(lines[-1]["mid"] - mid) > y_tol:
-                lines.append({"mid": mid, "words": [w]})
-            else:
-                bucket = lines[-1]
-                prev = len(bucket["words"])
-                bucket["words"].append(w)
-                bucket["mid"] = (bucket["mid"] * prev + mid) / (prev + 1)
-        return [sorted(item["words"], key=lambda w: w.get("x0", 0)) for item in lines if item.get("words")]
-
-    def detect_name_column_bounds(lines: List[List[Dict[str, Any]]]) -> Optional[Tuple[float, float]]:
-        """Return (x_start, x_end) bounds for CIRCUIT NAME column."""
-        for words in lines[:10]:
-            tokens = [(w.get("text", "") or "") for w in words]
-            joined = " ".join(t.upper() for t in tokens)
-            if "CIRCUIT" not in joined or "NAME" not in joined:
-                continue
-            start = None
-            end = None
-            for idx, w in enumerate(words):
-                token = (w.get("text", "") or "").upper()
-                if "NAME" in token and start is None:
-                    start = w.get("x0", 0) - 2
-                    # look for the next header word (e.g., ELASTIC, RATING, INITIAL, USE)
-                    for nxt in words[idx + 1 :]:
-                        nxt_token = (nxt.get("text", "") or "").upper()
-                        if header_pat.match(nxt_token):
-                            end = nxt.get("x0", 0) - 2
-                            break
-                        if re.search(r"ELASTIC|RATING|INITIAL|USED|USE|CONTROL|CURRENT", nxt_token):
-                            end = nxt.get("x0", 0) - 2
-                            break
-                    if end is None:
-                        # fallback to a generous width if we cannot locate the next column header
-                        end = start + 220
-                    break
-            if start is not None:
-                return (start, end if end is not None else start + 220)
-        return None
-
-    def detect_panel_label(text: str) -> Optional[str]:
-        if not text:
-            return None
-        match_no1 = re.search(r'NO\.?\s*1\s*(?:GROUP\s+STARTER\s+PANEL|GSP)', text)
-        match_no2 = re.search(r'NO\.?\s*2\s*(?:GROUP\s+STARTER\s+PANEL|GSP)', text)
-        if match_no1 and match_no2:
-            return "No.1 GROUP STARTER PANEL" if match_no1.start() <= match_no2.start() else "No.2 GROUP STARTER PANEL"
-        if match_no1:
-            return "No.1 GROUP STARTER PANEL"
-        if match_no2:
-            return "No.2 GROUP STARTER PANEL"
-        return None
-
-    def finalize_pending(pending: Optional[Dict[str, Any]], store: Dict[str, List[Dict[str, Any]]]):
-        if not pending:
-            return
-        label = pending.get("label")
-        if not label:
-            return
-        name = clean(" ".join(pending.get("name_parts", [])))
-        if name:
-            store[label].append(
-                {
-                    "code": pending["code"],
-                    "name": name,
-                    "order": pending.get("order", 0),
-                }
-            )
-
-    panel_rows: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    panel_order: Dict[str, int] = defaultdict(int)
-
+    code_pat = re.compile(r'P\d{2}-\d{2,3}-\d{2}-PN', re.I)
+    
+    panel_circuits = {
+        "No.1 GROUP STARTER PANEL": [],
+        "No.2 GROUP STARTER PANEL": []
+    }
+    
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
+            max_pages = min(25, len(pdf.pages))
+            for page_num in range(max_pages):
+                page = pdf.pages[page_num]
                 try:
                     text = page.extract_text() or ""
                 except Exception:
                     continue
-                upper = text.upper()
-                if "NAME PLATE" not in upper or "GSP" not in upper:
-                    continue
-                words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-                if not words:
-                    continue
-                lines = group_words(words)
-                if not lines:
-                    continue
-                name_bounds = detect_name_column_bounds(lines)
-                name_col = name_bounds[0] if name_bounds else None
-                name_col_end = name_bounds[1] if name_bounds else None
 
-                pending: Optional[Dict[str, Any]] = None
-                current_label: Optional[str] = None
+                text_upper = text.upper()
+                
+                is_gsp_table_page = False
+                
+                if "NAME PLATE" in text_upper and "MCCB" in text_upper:
+                    is_gsp_table_page = True
+                
+                elif "SPECIFICATION LIST" in text_upper and "GROUP STARTER PANEL" in text_upper:
+                    is_gsp_table_page = True
+                
+                elif ("GSP" in text_upper or "GROUP STARTER" in text_upper) and \
+                     ("CIRCUIT NAME" in text_upper or ("CIR" in text_upper and "NO" in text_upper)):
+                    is_gsp_table_page = True
+                
+                if not is_gsp_table_page:
+                    continue
 
-                for line_words in lines:
-                    line_text = clean(" ".join(w.get("text", "") for w in line_words))
-                    if not line_text:
-                        finalize_pending(pending, panel_rows)
-                        pending = None
+                current_panel = None
+                if re.search(r'NO\.?\s*1|GSP\s*NO\.?\s*1', text_upper):
+                    current_panel = "No.1 GROUP STARTER PANEL"
+                elif re.search(r'NO\.?\s*2|GSP\s*NO\.?\s*2', text_upper):
+                    current_panel = "No.2 GROUP STARTER PANEL"
+                else:
+                    continue
+
+                tables = page.extract_tables()
+                if not tables:
+                    continue
+
+                for table_idx, table in enumerate(tables):
+                    if not table or len(table) < 2:
                         continue
-                    upper_line = line_text.upper()
-                    panel_label = detect_panel_label(upper_line)
-                    if panel_label:
-                        finalize_pending(pending, panel_rows)
-                        pending = None
-                        current_label = panel_label
-                        continue
-                    if upper_line.startswith("NAME PLATE") or header_pat.match(upper_line):
-                        finalize_pending(pending, panel_rows)
-                        pending = None
-                        continue
-                    match = code_pat.search(upper_line)
-                    if match:
-                        finalize_pending(pending, panel_rows)
-                        if not current_label:
+
+                    header_row_idx = None
+                    cir_no_col = None
+                    circuit_name_col = None
+
+                    for idx, row in enumerate(table[:15]):
+                        if not row:
                             continue
-                        code = match.group(0).upper()
-                        code_norm = re.sub(r'[^A-Z0-9]+', '', code)
-                        code_word = None
-                        for w in line_words:
-                            word_norm = re.sub(r'[^A-Z0-9]+', '', (w.get("text", "") or '').upper())
-                            if code_norm and code_norm in word_norm:
-                                code_word = w
+                        
+                        row_text = " ".join([str(cell or "").upper() for cell in row])
+                        
+                        has_cir_no = ("CIR" in row_text and "NO" in row_text) or "CIRCUIT NO" in row_text
+                        has_circuit_name = "CIRCUIT NAME" in row_text or ("CIRCUIT" in row_text and "NAME" in row_text)
+                        
+                        if has_cir_no and has_circuit_name:
+                            header_row_idx = idx
+                            
+                            for col_idx, cell in enumerate(row):
+                                if not cell:
+                                    continue
+                                cell_text = str(cell).upper()
+                                
+                                if (("CIR" in cell_text or "CIRCUIT" in cell_text) and "NO" in cell_text and "NAME" not in cell_text):
+                                    cir_no_col = col_idx
+                                
+                                if ("CIRCUIT" in cell_text and "NAME" in cell_text) or \
+                                   (cell_text.strip() == "NAME" and cir_no_col is not None):
+                                    if circuit_name_col is None:
+                                        circuit_name_col = col_idx
+                            
+                            if cir_no_col is not None and circuit_name_col is not None:
                                 break
-                        base_x = code_word.get("x1", code_word.get("x0", 0)) if code_word else None
-                        threshold = name_col if name_col is not None else None
-                        if threshold is None:
-                            threshold = (base_x or 0) + 4
-                        name_words = [w for w in line_words if w.get("x0", 0) >= threshold - 1]
-                        if name_col_end is not None:
-                            name_words = [w for w in name_words if w.get("x1", 0) <= name_col_end + 2]
-                        name_part = clean(" ".join(w.get("text", "") for w in name_words))
-                        pending = {
-                            "code": code,
-                            "name_parts": [],
-                            "order": panel_order[current_label],
-                            "name_x0": threshold,
-                            "name_x1": name_col_end,
-                            "label": current_label,
-                        }
-                        panel_order[current_label] += 1
-                        if name_part and not header_pat.match(name_part.upper()):
-                            pending["name_parts"].append(name_part)
-                        continue
-                    if pending:
-                        name_x0 = pending.get("name_x0", 0)
-                        name_x1 = pending.get("name_x1")
-                        min_x = min((w.get("x0", 0) for w in line_words), default=0)
-                        max_x = max((w.get("x1", 0) for w in line_words), default=0)
-                        within_left = min_x >= name_x0 - 4
-                        within_right = True if name_x1 is None else max_x <= name_x1 + 4
-                        if within_left and within_right:
-                            part = clean(" ".join(w.get("text", "") for w in line_words))
-                            if part and not header_pat.match(part.upper()):
-                                pending["name_parts"].append(part)
-                                continue
-                        finalize_pending(pending, panel_rows)
-                        pending = None
 
-                finalize_pending(pending, panel_rows)
-    except Exception:
-        return []
+                    if header_row_idx is None or cir_no_col is None or circuit_name_col is None:
+                        continue
+
+                    pending_code = None
+                    pending_name_parts = []
+
+                    for row in table[header_row_idx + 1:]:
+                        if not row or len(row) <= max(cir_no_col, circuit_name_col):
+                            continue
+
+                        cir_no_cell = str(row[cir_no_col] or "").strip()
+                        circuit_name_cell = str(row[circuit_name_col] or "").strip()
+
+                        code_match = code_pat.search(cir_no_cell)
+
+                        if code_match:
+                            if pending_code and pending_name_parts:
+                                full_name = " ".join(pending_name_parts)
+                                full_name = re.sub(r'\s+', ' ', full_name).strip()
+                                full_name = full_name.replace(pending_code, "").strip()
+                                
+                                if full_name:
+                                    if not any(c["code"] == pending_code for c in panel_circuits[current_panel]):
+                                        panel_circuits[current_panel].append({
+                                            "code": pending_code,
+                                            "name": full_name
+                                        })
+
+                            pending_code = code_match.group(0).upper()
+                            pending_name_parts = []
+                            
+                            if circuit_name_cell:
+                                clean_name = circuit_name_cell.replace(pending_code, "").strip()
+                                if clean_name and \
+                                   clean_name.upper() not in ["CIR", "NO", "CIRCUIT", "NAME", "-"] and \
+                                   len(clean_name) > 1:
+                                    pending_name_parts.append(clean_name)
+
+                        elif pending_code and circuit_name_cell:
+                            clean_name = circuit_name_cell.strip()
+                            if clean_name and \
+                               clean_name.upper() not in ["CIR", "NO", "CIRCUIT", "NAME", "-"] and \
+                               len(clean_name) > 1:
+                                pending_name_parts.append(clean_name)
+
+                    if pending_code and pending_name_parts:
+                        full_name = " ".join(pending_name_parts)
+                        full_name = re.sub(r'\s+', ' ', full_name).strip()
+                        full_name = full_name.replace(pending_code, "").strip()
+                        
+                        if full_name:
+                            if not any(c["code"] == pending_code for c in panel_circuits[current_panel]):
+                                panel_circuits[current_panel].append({
+                                    "code": pending_code,
+                                    "name": full_name
+                                })
+
+    except Exception as e:
+        print(f"[ERROR] GSP 파싱 실패: {e}")
+        import traceback
+        traceback.print_exc()
 
     results: List[Dict[str, object]] = []
-    for num, label in ((1, "No.1 GROUP STARTER PANEL"), (2, "No.2 GROUP STARTER PANEL")):
-        rows = panel_rows.get(label)
-        if not rows:
+    
+    for panel_num, (panel_label, circuits) in enumerate([
+        ("No.1 GROUP STARTER PANEL", panel_circuits["No.1 GROUP STARTER PANEL"]),
+        ("No.2 GROUP STARTER PANEL", panel_circuits["No.2 GROUP STARTER PANEL"])
+    ], start=1):
+        
+        if not circuits:
             continue
-        unique: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            code = (row.get("code") or "").upper()
-            name = (row.get("name") or "").strip()
-            if not code or not name:
-                continue
-            if code not in unique or len(name) > len(unique[code]["name"]):
-                unique[code] = {
-                    "code": code,
-                    "name": name,
-                    "order": row.get("order", 0),
-                }
-        if not unique:
-            continue
-        sorted_rows = sorted(unique.values(), key=lambda r: (circuit_sort_key(r.get("code", "")), r.get("order", 0)))
-        content = "\n".join(f"{row['code']} {row['name']}" for row in sorted_rows).strip()
-        results.append(
-            {
-                "panel": label,
-                "placeholder": f"gsp_function_no{num}",
-                "content": content,
-                "rows": sorted_rows,
-            }
-        )
-
-    return results
-
-
-def parse_emergency_stop(pdf_path: str) -> List[Dict[str, object]]:
-    """Parse EMERGENCY STOP TEST table including COLOR and panel groups."""
-    raw = read_text(pdf_path, max_pages=80)
-    if not raw:
-        return []
-    text = raw.replace("\r", "\n").replace("\x0c", "\n")
-    upper = text.upper()
-    code_pattern = re.compile(r'\b(?:ES|CO2|FOAM|PT)-\d+[A-Z]?\b')
-    matches = list(code_pattern.finditer(upper))
-    if not matches:
-        return []
-
-    def clean_line(line: str) -> str:
-        line = re.sub(r'\s+', ' ', line)
-        return line.strip(" :-·•.\t")
-
-    records: List[Dict[str, object]] = []
-    for idx, match in enumerate(matches):
-        code = match.group(0)
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
-        block = text[start:end]
-        remainder = block[len(code):]
-        remainder = remainder.lstrip()
-        color = ""
-        if remainder.startswith("("):
-            close_idx = remainder.find(")")
-            if close_idx != -1:
-                color = remainder[1:close_idx].strip()
-                remainder = remainder[close_idx + 1 :].lstrip()
-
-        lines = remainder.splitlines()
-        name_lines: List[str] = []
-        consumed = 0
-        for line in lines:
-            cleaned = clean_line(line)
-            consumed += 1
-            if not cleaned:
-                continue
-            if cleaned.upper().startswith("SATISFACTORY"):
-                continue
-            if cleaned.startswith("[") or code_pattern.search(cleaned.upper()):
-                consumed -= 1
-                break
-            if re.search(r'P\d{2}-\d{3}-\d{2}-', cleaned.upper()):
-                consumed -= 1
-                break
-            name_lines.append(cleaned)
-            if "[" in line:
-                break
-        if consumed < 0:
-            consumed = 0
-        name = " ".join(name_lines).strip()
-        remaining_text = "\n".join(lines[consumed:])
-
-        groups: List[Dict[str, object]] = []
-        panel_matches = list(re.finditer(r'\[([^\]]{2,120})\]', remaining_text))
-        if panel_matches:
-            for g_idx, gm in enumerate(panel_matches):
-                header = gm.group(1).replace('*', '').strip()
-                seg_start = gm.end()
-                seg_end = panel_matches[g_idx + 1].start() if g_idx + 1 < len(panel_matches) else len(remaining_text)
-                segment = remaining_text[seg_start:seg_end]
-                circuits = _parse_circuit_list(segment)
-                groups.append({"panel_header": header, "circuits": circuits})
-        else:
-            # fallback: scan lines for headers starting with NO.
-            pending_header = None
-            buffer_text: List[str] = []
-            for line in remaining_text.splitlines():
-                cleaned = clean_line(line)
-                if not cleaned:
-                    continue
-                if cleaned.startswith("NO.") or cleaned.startswith("№"):
-                    if pending_header:
-                        circuits = _parse_circuit_list("\n".join(buffer_text))
-                        groups.append({"panel_header": pending_header, "circuits": circuits})
-                    pending_header = cleaned
-                    buffer_text = []
-                    continue
-                buffer_text.append(cleaned)
-            if pending_header:
-                circuits = _parse_circuit_list("\n".join(buffer_text))
-                groups.append({"panel_header": pending_header, "circuits": circuits})
-
-        records.append({
-            "code": code,
-            "color": color,
-            "name": name,
-            "groups": groups,
+        
+        circuits.sort(key=lambda c: c["code"])
+        content = "\n".join([f"{c['code']} {c['name']}" for c in circuits])
+        
+        results.append({
+            "panel": panel_label,
+            "placeholder": f"gsp_function_no{panel_num}",
+            "content": content,
+            "rows": circuits
         })
 
-    merged: Dict[str, Dict[str, object]] = {}
-    for rec in records:
-        code = rec.get("code", "")
-        if code in merged:
-            existing = merged[code]
-            if not existing.get("name") and rec.get("name"):
-                existing["name"] = rec.get("name")
-            if not existing.get("color") and rec.get("color"):
-                existing["color"] = rec.get("color")
-            existing_groups = existing.setdefault("groups", [])
-            for g in rec.get("groups", []):
-                if g not in existing_groups:
-                    existing_groups.append(g)
-        else:
-            merged[code] = rec
-    return list(merged.values())
-
-
-def _parse_circuit_list(chunk: str) -> List[str]:
-    tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', chunk.upper())
-    if tokens:
-        seen: List[str] = []
-        for tok in tokens:
-            if tok not in seen:
-                seen.append(tok)
-        return seen
-    parts: List[str] = []
-    for line in chunk.splitlines():
-        for part in re.split(r'[\s,;\u3001]+', line):
-            val = part.strip()
-            if val:
-                parts.append(val)
-    return parts
-
+    return results   
 
 def parse_emergency_colorplate(msbd_pdf: str) -> List[Dict[str, object]]:
     raw = read_text(msbd_pdf, max_pages=60)
@@ -1090,125 +1608,503 @@ def parse_emergency_colorplate(msbd_pdf: str) -> List[Dict[str, object]]:
         else:
             seen[code] = it
     return list(seen.values())
-# ===== Overwrite with checkbox-aware IP extractor =====
-def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
-    """Detect IP grade from GENERAL SPEC via checkbox detection."""
-    try:
-        import pdfplumber, re
-        found = None
-        with pdfplumber.open(pdf_path) as pdf:
-            for page in pdf.pages:
-                text_u = (page.extract_text() or "").upper()
-                if "GENERAL" not in text_u or "SPEC" not in text_u:
-                    continue
-                words = page.extract_words() or []
-                ips = []
-                for w in words:
-                    m = re.match(r"IP[-\s]?([0-9]{2})\b", w["text"].upper())
-                    if m:
-                        ips.append((int(m.group(1)), w))
-                if not ips:
-                    continue
-                chars = page.chars or []
-                marks = [c for c in chars if c.get("text") in ("■","●","◼","▪","∙") ]
-                rects = [r for r in (page.rects or []) if r.get("non_stroking_color") is not None and 2.0 <= r.get("width",0) <= 12.0 and 2.0 <= r.get("height",0) <= 12.0]
-                def has_mark_near(w):
-                    x0,x1,y0,y1 = w["x0"], w["x1"], w["top"], w["bottom"]
-                    mx0, mx1, my0, my1 = x0-40, x0-4, y0-6, y1+6
-                    for c in marks:
-                        if mx0 <= c["x0"] <= mx1 and my0 <= c["top"] <= my1:
-                            return True
-                    for r in rects:
-                        cx = (r["x0"] + r["x1"])/2.0
-                        cy = (r["top"] + r["bottom"])/2.0
-                        if mx0 <= cx <= mx1 and my0 <= cy <= my1:
-                            return True
-                    return False
-                for val, w in ips:
-                    if has_mark_near(w):
-                        found = val
-                        break
-                if found is None:
-                    ips.sort(key=lambda t: (t[1]["x0"], t[1]["top"]))
-                    found = ips[0][0]
-                break
-        return f"IP{int(found):02d}" if found is not None else ""
-    except Exception:
-        import re
-        txt = extract_text_fast(pdf_path).upper()
-        m = re.search(r"\bIP\s*([0-9]{2})\b", txt)
-        return f"IP{m.group(1)}" if m else ""
-
-# ==================== Patch: robust IP extractor & panel table reader (fix10) ====================
-
-def extract_ip_grade(pdf_path: str) -> str:  # type: ignore[override]
-    """
-    Robustly detect IP grade:
-    - Scan all pages, prefer page containing "GENERAL" & "SPEC" (but not required)
-    - Detect check mark to LEFT or RIGHT of IPxx (■ glyphs or filled small rects)
-    - Fallback to first/left-most IP token on preferred page
-    - Normalize to "IP{nn}"
-    """
-    import re
-    try:
-        import pdfplumber
-    except Exception:
-        txt = extract_text_fast(pdf_path).upper()
-        m = re.search(r"\bIP\s*([0-9]{2})\b", txt)
-        return f"IP{m.group(1)}" if m else ""
-
-    def ip_tokens(page):
-        words = page.extract_words() or []
-        toks = []
-        for w in words:
-            t = w.get("text","").upper()
-            m = re.match(r"IP[-\s]?([0-9]{2})\b", t)
-            if m:
-                toks.append((int(m.group(1)), w))
-        return toks
-
-    with pdfplumber.open(pdf_path) as pdf:
-        pages = list(pdf.pages)
-        scored = []
-        for i, pg in enumerate(pages):
-            text_u = (pg.extract_text() or "").upper()
-            score = 0
-            if "GENERAL" in text_u: score += 2
-            if "SPEC" in text_u: score += 2
-            score += len(ip_tokens(pg))
-            scored.append((score, i, pg))
-        scored.sort(reverse=True)
-        chosen = [pg for score, i, pg in scored if score > 0] or [pages[0]]
-
-        def has_mark_near(page, w):
-            x0,x1,y0,y1 = w["x0"], w["x1"], w["top"], w["bottom"]
-            # left window and right window
-            windows = [(x0-40, x0-4, y0-8, y1+8), (x1+4, x1+40, y0-8, y1+8)]
-            chars = page.chars or []
-            rects = [r for r in (page.rects or []) if r.get("non_stroking_color") is not None and 1.5 <= r.get("width",0) <= 14.0 and 1.5 <= r.get("height",0) <= 14.0]
-            for (mx0, mx1, my0, my1) in windows:
-                for c in chars:
-                    if c.get("text") in ("■","●","◼","▪","∙") and mx0 <= c.get("x0",0) <= mx1 and my0 <= c.get("top",0) <= my1:
-                        return True
-                for r in rects:
-                    cx = (r["x0"]+r["x1"])/2.0; cy = (r["top"]+r["bottom"])/2.0
-                    if mx0 <= cx <= mx1 and my0 <= cy <= my1:
-                        return True
-            return False
-
-        for pg in chosen:
-            toks = ip_tokens(pg)
-            if not toks:
-                continue
-            for val, w in toks:
-                if has_mark_near(pg, w):
-                    return f"IP{val:02d}"
-            toks.sort(key=lambda t: (t[1]["x0"], t[1]["top"]))
-            return f"IP{toks[0][0]:02d}"
-    return ""
-
-
-
-# ---------------------------
 
 extract_panel_info_from_msbd = extract_acb_setting_panels
+
+# ==================== Emergency Stop 완전 개선 버전 v2 ====================
+
+def parse_emergency_stop_from_mccb(pdf_path: str) -> List[Dict[str, object]]:
+    """Emergency Stop 완전 범용 파서 (v3.2 - REMARKS 컬럼 집중)"""
+    if not pdf_path or not os.path.exists(pdf_path):
+        return []
+    
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            print(f"\n{'='*60}")
+            print(f"Emergency Stop 파싱: {os.path.basename(pdf_path)}")
+            print(f"총 {len(pdf.pages)} 페이지")
+            print(f"{'='*60}\n")
+            
+            print("[STEP 1] NAME PLATE (COLOR PLATE) 스캔...")
+            code_info_map = _extract_emergency_codes_from_nameplate(pdf)
+            
+            if not code_info_map:
+                print("[WARN] NAME PLATE에서 CODE를 찾을 수 없습니다.")
+                return []
+            
+            print(f"\n✓ {len(code_info_map)}개 CODE 감지:")
+            for code, info in sorted(code_info_map.items()):
+                color = info.get('color', '')
+                name = info.get('name', '')[:40]
+                print(f"  • {code:10s} {color:15s} {name}...")
+            
+            print(f"\n[STEP 2] NAME PLATE (MCCB) 페이지 스캔...")
+            all_circuits = _extract_emergency_circuits(pdf)
+            
+            print(f"\n✓ 총 {len(all_circuits)}개 Circuit 추출")
+            
+            code_circuit_count = {}
+            for circuit in all_circuits:
+                code = circuit.get('code', '')
+                code_circuit_count[code] = code_circuit_count.get(code, 0) + 1
+            
+            print(f"\nCODE별 Circuit 매칭 현황:")
+            for code in sorted(code_info_map.keys()):
+                count = code_circuit_count.get(code, 0)
+                status = "✓" if count > 0 else "✗"
+                print(f"  {status} {code:10s} → {count} circuits")
+            
+            print(f"\n[STEP 3] 그룹화 및 결과 생성...")
+            grouped = _group_emergency_by_code(all_circuits, code_info_map)
+            
+            print(f"\n✓ {len(grouped)}개 CODE 결과 생성")
+            print(f"  - Circuit 매칭된 CODE: {len([g for g in grouped if g['groups']])}개")
+            print(f"  - Circuit 매칭 안된 CODE: {len([g for g in grouped if not g['groups']])}개")
+            print(f"{'='*60}\n")
+            
+            return grouped
+    
+    except Exception as e:
+        print(f"[ERROR] Emergency Stop 파싱 실패: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def _extract_emergency_codes_from_nameplate(pdf) -> Dict[str, Dict[str, str]]:
+    """NAME PLATE (COLOR PLATE)에서 Emergency CODE 추출"""
+    code_map = {}
+    max_scan_pages = min(50, len(pdf.pages))
+    
+    for page_idx in range(max_scan_pages):
+        page = pdf.pages[page_idx]
+        text = page.extract_text() or ""
+        text_upper = text.upper()
+        
+        if not ("COLOR PLATE" in text_upper or "COLOUR PLATE" in text_upper):
+            continue
+        
+        print(f"[INFO] COLOR PLATE 페이지: Page {page_idx + 1}")
+        
+        text_codes = _parse_colorplate_comprehensive(text)
+        for code, info in text_codes.items():
+            if code not in code_map:
+                code_map[code] = info
+                print(f"  추가: {code} = {info['color']} / {info['name'][:40] if info['name'] else ''}...")
+            else:
+                if not code_map[code].get('color') and info.get('color'):
+                    code_map[code]['color'] = info['color']
+                if not code_map[code].get('name') and info.get('name'):
+                    code_map[code]['name'] = info['name']
+        
+        tables = page.extract_tables()
+        if tables:
+            for table_idx, table in enumerate(tables):
+                if not table or len(table) < 2:
+                    continue
+                
+                table_codes = _parse_colorplate_table(table, table_idx)
+                for code, info in table_codes.items():
+                    if code not in code_map:
+                        code_map[code] = info
+                    else:
+                        if not code_map[code].get('color') and info.get('color'):
+                            code_map[code]['color'] = info['color']
+                        if not code_map[code].get('name') and info.get('name'):
+                            code_map[code]['name'] = info['name']
+    
+    print(f"[INFO] 이 {len(code_map)}개 CODE 추출\n")
+    return code_map
+
+
+def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
+    """텍스트에서 모든 CODE 패턴 추출"""
+    code_map = {}
+    
+    emergency_patterns = [
+        re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(PT-?\d+)\b', re.I),
+        re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
+    ]
+    
+    color_keywords = [
+        'RED', 'PINK', 'BROWN', 'BLUE', 'GREEN', 'YELLOW',
+        'GOLDEN', 'SILVER', 'PURPLE', 'ORANGE', 'WHITE', 'BLACK',
+        'LIGHT', 'DARK', 'NAVY'
+    ]
+    
+    lines = text.split('\n')
+    
+    for i, line in enumerate(lines):
+        line_upper = line.upper()
+        
+        found_code = None
+        for pattern in emergency_patterns:
+            match = pattern.search(line_upper)
+            if match:
+                found_code = match.group(1).upper()
+                if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
+                    found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
+                break
+        
+        if not found_code:
+            continue
+        
+        color = ""
+        words = line_upper.split()
+        for word in words:
+            if word in color_keywords:
+                color = word
+                break
+        
+        name = ""
+        code_pos = line_upper.find(found_code)
+        if code_pos != -1:
+            after_code = line[code_pos + len(found_code):].strip()
+            for kw in color_keywords:
+                after_code = re.sub(r'\b' + kw + r'\b', '', after_code, flags=re.I)
+            after_code = re.sub(r'\s+', ' ', after_code).strip()
+            if len(after_code) > 10:
+                name = after_code
+        
+        if found_code:
+            code_map[found_code] = {"color": color, "name": name}
+    
+    return code_map
+
+
+def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict[str, str]]:
+    """테이블에서 CODE, COLOR, NAME 추출"""
+    code_map = {}
+    
+    if not table or len(table) < 1:
+        return code_map
+    
+    emergency_patterns = [
+        re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(PT-?\d+)\b', re.I),
+        re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
+    ]
+    
+    for row in table:
+        if not row:
+            continue
+        
+        found_code = None
+        for cell in row:
+            if not cell:
+                continue
+            cell_text = str(cell).strip().upper()
+            for pattern in emergency_patterns:
+                match = pattern.search(cell_text)
+                if match:
+                    found_code = match.group(1).upper()
+                    if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
+                        found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
+                    break
+            if found_code:
+                break
+        
+        if found_code:
+            code_map[found_code] = {"color": "", "name": ""}
+    
+    return code_map
+
+
+def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
+    """MCCB/FEEDER/GSP 페이지에서 Emergency Circuit 추출"""
+    all_circuits = []
+    max_scan_pages = min(len(pdf.pages), 60)
+    circuit_pattern = re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I)
+    
+    for page_idx in range(max_scan_pages):
+        page = pdf.pages[page_idx]
+        text = page.extract_text() or ""
+        text_upper = text.upper()
+        
+        is_circuit_page = False
+        if "NAME PLATE" in text_upper and "MCCB" in text_upper:
+            is_circuit_page = True
+        elif "SPECIFICATION" in text_upper and "LIST" in text_upper:
+            if circuit_pattern.search(text_upper):
+                is_circuit_page = True
+        elif circuit_pattern.search(text_upper) and "REMARKS" in text_upper:
+            if any(kw in text_upper for kw in ['FEEDER', 'PANEL', 'GSP', 'GROUP STARTER']):
+                is_circuit_page = True
+        
+        if not is_circuit_page:
+            continue
+        
+        panel_name, doc_type = _detect_emergency_panel_info(text)
+        print(f"[DEBUG] Page {page_idx + 1}: {panel_name} ({doc_type})")
+        
+        tables = page.extract_tables()
+        if tables:
+            for table_idx, table in enumerate(tables):
+                circuits = _parse_emergency_circuit_table(table, panel_name, doc_type, page_idx + 1)
+                if circuits:
+                    print(f"  └─ Table {table_idx + 1}: {len(circuits)} circuits")
+                    for c in circuits:
+                        print(f"     {c['circuit_no']} → {c['code']}")
+                all_circuits.extend(circuits)
+    
+    return all_circuits
+
+
+def _detect_emergency_panel_info(text: str) -> Tuple[str, str]:
+    """Panel 이름과 문서 타입(GSP/MSBD) 감지"""
+    text_upper = text.upper()
+    
+    if "GROUP STARTER" in text_upper or "GSP" in text_upper:
+        doc_type = "GSP"
+        if re.search(r'NO\.?\s*1|GSP\s*NO\.?\s*1', text_upper):
+            return "No.1 GROUP STARTER PANEL", doc_type
+        elif re.search(r'NO\.?\s*2|GSP\s*NO\.?\s*2', text_upper):
+            return "No.2 GROUP STARTER PANEL", doc_type
+        else:
+            return "GROUP STARTER PANEL", doc_type
+    else:
+        doc_type = "MSBD"
+        if "FEEDER" in text_upper:
+            if re.search(r'NO\.?\s*1', text_upper):
+                return "No.1 AC440V FEEDER PANEL", doc_type
+            elif re.search(r'NO\.?\s*2', text_upper):
+                return "No.2 AC440V FEEDER PANEL", doc_type
+            else:
+                return "AC440V FEEDER PANEL", doc_type
+        elif "EMERGENCY" in text_upper or "EMCY" in text_upper:
+            return "EMERGENCY PANEL", doc_type
+        else:
+            if re.search(r'NO\.?\s*1', text_upper):
+                return "No.1 PANEL", doc_type
+            elif re.search(r'NO\.?\s*2', text_upper):
+                return "No.2 PANEL", doc_type
+            else:
+                return "MSBD PANEL", doc_type
+
+
+def _parse_emergency_circuit_table(
+    table: List[List], 
+    panel_name: str, 
+    doc_type: str, 
+    page_num: int
+) -> List[Dict[str, str]]:
+    """Circuit 테이블에서 Emergency 관련 Circuit 추출"""
+    if not table or len(table) < 2:
+        return []
+    
+    circuits = []
+    header_idx = None
+    cir_no_col = None
+    cir_name_col = None
+    remarks_col = None
+    
+    for idx, row in enumerate(table[:20]):
+        if not row:
+            continue
+        
+        row_text = ' '.join([str(cell or '').upper() for cell in row])
+        
+        if 'CIR' in row_text or 'CIRCUIT' in row_text or 'NAME PLATE' in row_text:
+            header_idx = idx
+            
+            for col_idx in range(len(row) - 1, -1, -1):
+                cell = row[col_idx]
+                if not cell:
+                    continue
+                cell_upper = str(cell).upper().strip()
+                if 'REMARK' in cell_upper and remarks_col is None:
+                    remarks_col = col_idx
+                    break
+            
+            for col_idx, cell in enumerate(row):
+                if not cell:
+                    continue
+                cell_upper = str(cell).upper().strip()
+                
+                if 'NO' in cell_upper and ('CIR' in cell_upper or 'CIRCUIT' in cell_upper):
+                    if 'NAME' not in cell_upper and 'TYPE' not in cell_upper:
+                        cir_no_col = col_idx
+                
+                if 'NAME' in cell_upper:
+                    if 'CIR' in cell_upper or 'CIRCUIT' in cell_upper or 'BREAKER' not in cell_upper:
+                        if cir_name_col is None:
+                            cir_name_col = col_idx
+            
+            if cir_no_col is not None:
+                break
+    
+    if header_idx is None or cir_no_col is None:
+        return []
+    
+    circuit_patterns = [
+        re.compile(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', re.I),
+        re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I),
+    ]
+    
+    emergency_code_patterns = [
+        re.compile(r'\b(ES-\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(CO2-\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(PT-\d+)\b', re.I),
+        re.compile(r'\b(FOAM-\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(ES\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
+    ]
+    
+    for row_idx in range(header_idx + 1, len(table)):
+        row = table[row_idx]
+        if not row:
+            continue
+        
+        cir_no_cell = str(row[cir_no_col] or '').strip() if cir_no_col < len(row) else ""
+        circuit_match = None
+        circuit_no = ""
+        
+        for pattern in circuit_patterns:
+            circuit_match = pattern.search(cir_no_cell)
+            if circuit_match:
+                circuit_no = circuit_match.group(0).upper()
+                break
+        
+        if not circuit_no:
+            continue
+        
+        code_from_remarks = ""
+        if remarks_col is not None and remarks_col < len(row):
+            remarks_text = str(row[remarks_col] or '').strip().upper()
+            for pattern in emergency_code_patterns:
+                match = pattern.search(remarks_text)
+                if match:
+                    code_from_remarks = match.group(1).upper()
+                    if '-' not in code_from_remarks and re.match(r'[A-Z]{2,4}\d+', code_from_remarks):
+                        code_from_remarks = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code_from_remarks)
+                    break
+        
+        if not code_from_remarks:
+            continue
+        
+        circuit_name = ""
+        if cir_name_col is not None and cir_name_col < len(row):
+            name_cell = str(row[cir_name_col] or '').strip()
+            name_cell = name_cell.replace(circuit_no, '').strip()
+            name_cell = re.sub(r'\s+', ' ', name_cell).strip()
+            if name_cell and len(name_cell) > 1:
+                circuit_name = name_cell
+        
+        if not circuit_name and row_idx + 1 < len(table):
+            next_row = table[row_idx + 1]
+            if cir_name_col < len(next_row):
+                next_name = str(next_row[cir_name_col] or '').strip()
+                has_next_circuit = any(pattern.search(str(next_row[cir_no_col] or '')) for pattern in circuit_patterns) if cir_no_col < len(next_row) else False
+                if not has_next_circuit and len(next_name) > 1:
+                    circuit_name = next_name
+        
+        if circuit_name:
+            circuits.append({
+                'circuit_no': circuit_no,
+                'circuit_name': circuit_name,
+                'panel': panel_name,
+                'doc_type': doc_type,
+                'code': code_from_remarks
+            })
+    
+    return circuits
+
+
+def _group_emergency_by_code(
+    circuits: List[Dict[str, str]], 
+    code_info_map: Dict[str, Dict[str, str]]
+) -> List[Dict[str, object]]:
+    """CODE별로 Circuit 그룹화 (GSP/MSBD 구분 표시)"""
+    code_circuits = {}
+    
+    code_variations = {}
+    for code in code_info_map.keys():
+        normalized = code.replace('-', '').replace(' ', '').upper()
+        code_variations[normalized] = code
+        code_variations[code] = code
+    
+    for circuit in circuits:
+        circuit_code = circuit.get('code', '').upper().strip()
+        if not circuit_code:
+            continue
+        
+        matched_code = None
+        if circuit_code in code_info_map:
+            matched_code = circuit_code
+        else:
+            normalized = circuit_code.replace('-', '').replace(' ', '')
+            if normalized in code_variations:
+                matched_code = code_variations[normalized]
+        
+        if not matched_code:
+            continue
+        
+        if matched_code not in code_circuits:
+            code_circuits[matched_code] = {'gsp': [], 'msbd': []}
+        
+        doc_type = circuit.get('doc_type', 'MSBD')
+        target_list = code_circuits[matched_code]['gsp'] if doc_type == 'GSP' else code_circuits[matched_code]['msbd']
+        
+        target_list.append({
+            'circuit_no': circuit.get('circuit_no', ''),
+            'circuit_name': circuit.get('circuit_name', ''),
+            'panel': circuit.get('panel', '')
+        })
+    
+    result = []
+    
+    for code in sorted(code_info_map.keys()):
+        info = code_info_map.get(code, {})
+        color = info.get("color", "")
+        name = info.get("name", "")
+        
+        gsp_circuits = code_circuits.get(code, {}).get('gsp', [])
+        msbd_circuits = code_circuits.get(code, {}).get('msbd', [])
+        
+        if not name:
+            all_circuits = gsp_circuits + msbd_circuits
+            if all_circuits:
+                name = max([c['circuit_name'] for c in all_circuits], key=len)
+        
+        groups = []
+        
+        if gsp_circuits:
+            gsp_panel_groups = {}
+            for circuit in gsp_circuits:
+                panel = circuit['panel']
+                if panel not in gsp_panel_groups:
+                    gsp_panel_groups[panel] = []
+                gsp_panel_groups[panel].append(circuit['circuit_no'])
+            
+            for panel, circs in sorted(gsp_panel_groups.items()):
+                groups.append({
+                    'panel_header': f"[GSP] {panel}",
+                    'circuits': sorted(set(circs))
+                })
+        
+        if msbd_circuits:
+            msbd_panel_groups = {}
+            for circuit in msbd_circuits:
+                panel = circuit['panel']
+                if panel not in msbd_panel_groups:
+                    msbd_panel_groups[panel] = []
+                msbd_panel_groups[panel].append(circuit['circuit_no'])
+            
+            for panel, circs in sorted(msbd_panel_groups.items()):
+                groups.append({
+                    'panel_header': f"[MSBD] {panel}",
+                    'circuits': sorted(set(circs))
+                })
+        
+        result.append({
+            'code': code,
+            'color': color,
+            'name': name,
+            'groups': groups
+        })
+    
+    return result
