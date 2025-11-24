@@ -167,7 +167,13 @@ PANEL_SLOT_SPECS = [
     {
         "slot": "bus",
         "title": "BUS-TIE",
-        "aliases": ["BUSTIE", "BUSTIEPANEL", "BUSTIESWBD", "BUSTIESWITCHBOARD"],
+        "aliases": [
+            "BUSTIE",           # 공백 없음
+            "BUSTIEPANEL",      # PANEL 붙음
+            "BUS-TIE",          # 하이픈 포함
+            "BUSTIESWITCHBOARD",
+            "BUSTIESWBD",
+        ],
     },
     {
         "slot": "emg",
@@ -251,6 +257,78 @@ def _median(values: List[float]) -> Optional[float]:
     if len(ordered) % 2:
         return float(ordered[mid])
     return (float(ordered[mid - 1]) + float(ordered[mid])) / 2.0
+
+# ------------------------
+# PANEL 감지 개선 함수들
+# ------------------------
+
+def _find_panel_headers_from_top(page) -> Dict[str, float]:
+    """
+    도면 상단(Y < 150)에서 PANEL 헤더 텍스트 찾기
+    ※ NO.1/NO.2 INCOMING은 병합되어 있어 구분 불가 → 체크박스로 판단
+    """
+    words = page.extract_words() or []
+    panel_positions = {}
+    
+    print("[DEBUG] 상단 헤더 스캔 중...")
+    
+    for word in words:
+        wy = (word["top"] + word["bottom"]) / 2.0
+        wx = (word["x0"] + word["x1"]) / 2.0
+        
+        # 상단 150px 이내만 확인
+        if wy > 150:
+            continue
+        
+        text = (word.get("text") or "").strip().upper()
+        
+        # BUS TIE 감지 (명확한 헤더)
+        if "BUS" in text or "TIE" in text:
+            # 주변 단어 확인
+            nearby_words = [
+                w for w in words 
+                if abs((w["top"] + w["bottom"]) / 2.0 - wy) < 20
+                and abs((w["x0"] + w["x1"]) / 2.0 - wx) < 100
+            ]
+            nearby_text = " ".join([w.get("text", "").upper() for w in nearby_words])
+            
+            if "BUS" in nearby_text and "TIE" in nearby_text:
+                if "bus" not in panel_positions:
+                    # BUS TIE 영역의 중심 X 좌표 계산
+                    bus_words = [w for w in nearby_words if "BUS" in w.get("text", "").upper() or "TIE" in w.get("text", "").upper()]
+                    if bus_words:
+                        bus_x_coords = [(w["x0"] + w["x1"]) / 2.0 for w in bus_words]
+                        bus_center = sum(bus_x_coords) / len(bus_x_coords)
+                        panel_positions["bus"] = bus_center
+                        print(f"  ✓ bus 발견 (header): BUS TIE at X={bus_center:.1f}, Y={wy:.1f}")
+        
+        # LINK TO EMCY 감지 (명확한 헤더)
+        if "LINK" in text or "EMCY" in text or "EMERGENCY" in text or "SWITCHBOARD" in text:
+            if "emg" not in panel_positions:
+                # EMCY 영역의 중심 X 좌표 계산
+                nearby_words = [
+                    w for w in words 
+                    if abs((w["top"] + w["bottom"]) / 2.0 - wy) < 20
+                    and abs((w["x0"] + w["x1"]) / 2.0 - wx) < 100
+                ]
+                emcy_words = [
+                    w for w in nearby_words 
+                    if any(kw in w.get("text", "").upper() for kw in ["LINK", "EMCY", "EMERGENCY", "SWITCHBOARD"])
+                ]
+                if emcy_words:
+                    emcy_x_coords = [(w["x0"] + w["x1"]) / 2.0 for w in emcy_words]
+                    emcy_center = sum(emcy_x_coords) / len(emcy_x_coords)
+                    panel_positions["emg"] = emcy_center
+                    print(f"  ✓ emg 발견 (header): at X={emcy_center:.1f}, Y={wy:.1f}")
+    
+    # NO.1/NO.2는 여기서 찾지 않음 (체크박스로 판단)
+    print("  ※ NO.1/NO.2 INCOMING은 체크박스 클러스터링으로 판단 예정")
+    
+    return panel_positions
+
+# 이 아래에 기존 _find_acb_setting_page() 함수가 있어야 함
+def _find_acb_setting_page(pdf) -> Tuple[Optional[int], Optional["pdfplumber.page.Page"]]:
+    ...
 
 def _find_acb_setting_page(pdf) -> Tuple[Optional[int], Optional["pdfplumber.page.Page"]]:
     """
@@ -373,264 +451,439 @@ def _blank_panel_records() -> List[Dict[str, str]]:
 
 def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
     """
-    페이지에서 채워진 체크박스(검은색 네모) 찾기
+    체크박스 감지 - 더 넓은 범위 스캔 (개선 버전)
     """
     checkboxes = []
     rects = page.rects or []
+    
+    print(f"[DEBUG] 전체 사각형 개수: {len(rects)}")
     
     for rect in rects:
         width = rect.get("x1", 0) - rect.get("x0", 0)
         height = rect.get("y1", 0) - rect.get("y0", 0)
         
-        # 3~20px 크기의 사각형
-        if not (3 <= width <= 20 and 3 <= height <= 20):
+        # 크기 범위 확대: 3~25px (기존 3~20)
+        if not (3 <= width <= 25 and 3 <= height <= 25):
             continue
         
-        # 검은색 체크 (fill color가 어두운지 확인)
+        # 정사각형에 가까운지 확인
+        aspect_ratio = max(width, height) / min(width, height)
+        if aspect_ratio > 2.0:  # 너비/높이 비율이 2배 이상 차이나면 제외
+            continue
+        
+        # Fill color 체크
         fill = rect.get("non_stroking_color")
         is_filled = False
         
         if fill is not None:
             if isinstance(fill, (tuple, list)):
-                # RGB/CMYK: 평균이 0.25 이하면 검은색
-                is_filled = sum(fill) / len(fill) < 0.25
+                # 0.3 이하면 검은색 (기존 0.25)
+                is_filled = sum(fill) / len(fill) < 0.3
             elif isinstance(fill, (int, float)):
-                # Grayscale: 0.25 이하면 검은색
-                is_filled = fill < 0.25
+                is_filled = fill < 0.3
+        
+        # Stroke(테두리)만 있어도 체크박스로 간주
+        stroke = rect.get("stroking_color")
+        if stroke is not None and not is_filled:
+            # 테두리가 있고 내부가 비어있으면 체크 안된 박스
+            # 하지만 주변에 'X'나 체크 표시가 있을 수 있으므로 일단 포함
+            is_filled = True  # 임시로 포함
         
         if is_filled:
             cx = (rect["x0"] + rect["x1"]) / 2.0
             cy = (rect["top"] + rect["bottom"]) / 2.0
-            checkboxes.append({"x": cx, "y": cy})
+            checkboxes.append({"x": cx, "y": cy, "width": width, "height": height})
     
-    print(f"  체크박스 좌표: {[(f'({c['x']:.1f}, {c['y']:.1f})') for c in checkboxes[:5]]}")
+    print(f"[DEBUG] 체크박스 후보: {len(checkboxes)}개")
+    
+    # Y 좌표별로 그룹화하여 같은 행의 체크박스 찾기
+    y_groups = {}
+    for cb in checkboxes:
+        y_key = round(cb["y"] / 10) * 10  # 10px 단위로 그룹화
+        if y_key not in y_groups:
+            y_groups[y_key] = []
+        y_groups[y_key].append(cb)
+    
+    print(f"[DEBUG] Y 좌표 그룹: {len(y_groups)}개")
+    for y_key, group in sorted(y_groups.items())[:5]:  # 상위 5개만 출력
+        x_coords = [f"{cb['x']:.1f}" for cb in group]
+        print(f"  Y≈{y_key}: {len(group)}개 at X=[{', '.join(x_coords)}]")
+    
     return checkboxes
 
 def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
     """
-    PANEL 헤더 텍스트와 체크박스 위치로 각 PANEL의 X축 범위 결정 (개선 버전)
+    PANEL 컬럼 감지 - 체크박스 클러스터링 (v4 - 50px threshold)
     """
     words = page.extract_words() or []
-    text = page.extract_text() or ""
-    panel_positions = {}
     
-    print("[DEBUG] PANEL 텍스트 검색 중...")
+    print("\n[DEBUG] PANEL 컬럼 감지 시작")
+    print("="*60)
     
-    # 방법1: 기존 aliases로 찾기
-    for spec in PANEL_SLOT_SPECS:
-        for word in words:
-            text_word = (word.get("text") or "").strip().upper()
-            text_norm = re.sub(r'[^A-Z0-9]', '', text_word)
-            
-            for alias in spec["aliases"]:
-                if alias in text_norm:
-                    cx = (word["x0"] + word["x1"]) / 2.0
-                    if spec["slot"] not in panel_positions:
-                        panel_positions[spec["slot"]] = cx
-                        print(f"  ✓ {spec['slot']} 발견 (alias): {text_word} at X={cx:.1f}")
-                    break
-            if spec["slot"] in panel_positions:
-                break
+    # 1단계: 헤더에서 BUS/EMCY 찾기
+    panel_positions = _find_panel_headers_from_top(page)
     
-    # 방법2: 특정 패턴으로 찾기 (EMERGENCY 패턴 강화)
-    patterns = {
-        "no1": [
-            r'NO\.?\s*1.*INCOMING',
-            r'P11-007-01A-PN',
-            r'NO\.?1&2.*INCOMING',
-            r'NO\.?\s*1\s*INCOMING\s*PANEL'
-        ],
-        "no2": [
-            r'NO\.?\s*2.*INCOMING',
-            r'P12-007-01A-PN',
-            r'NO\.?\s*2\s*INCOMING\s*PANEL'
-        ],
-        "bus": [
-            r'BUS[\s\-]*TIE',
-            r'BUS\s*TIE\s*PANEL',
-            r'BUSTIE'
-        ],
-        "emg": [
-            r'LINK.*EMC?Y',
-            r'EMERGENCY.*PANEL',
-            r'P31-003-11-PN',
-            r'LINK\s*TO\s*EMC?Y',
-            r'EMC?Y\s*SWITCHBOARD',
-            r'LINK\s*TO\s*EMERGENCY',
-            r'LINK.*SWITCHBOARD'
-        ]
-    }
+    print(f"\n[1단계] 헤더 감지: {len(panel_positions)}개")
+    for slot, x in sorted(panel_positions.items(), key=lambda item: item[1]):
+        print(f"  {slot}: X={x:.1f}")
     
-    for slot, pats in patterns.items():
-        if slot in panel_positions:
-            continue
-        
-        for pattern in pats:
-            matches = re.finditer(pattern, text.upper())
-            for match in matches:
-                # 매칭된 텍스트의 위치 찾기
-                matched_text = match.group(0)
-                for word in words:
-                    if matched_text in (word.get("text") or "").upper():
-                        cx = (word["x0"] + word["x1"]) / 2.0
-                        panel_positions[slot] = cx
-                        print(f"  ✓ {slot} 발견 (pattern): {matched_text} at X={cx:.1f}")
-                        break
-                if slot in panel_positions:
-                    break
-            if slot in panel_positions:
-                break
+    # 2단계: 체크박스 클러스터링
+    print("\n[2단계] 체크박스 클러스터링")
     
-    # 방법3: 체크박스 X 좌표 클러스터링으로 추정
-    if len(panel_positions) < 3:
-        print("[DEBUG] PANEL 텍스트 부족, 체크박스 클러스터링 시도...")
-        
-        # 체크박스 X 좌표 수집
-        x_coords = [cb["x"] for cb in checkboxes]
-        if x_coords:
-            x_coords_sorted = sorted(set(x_coords))
-            
-            # X 좌표를 그룹으로 묶기 (50px 이내는 같은 그룹)
-            clusters = []
-            current_cluster = [x_coords_sorted[0]]
-            
-            for x in x_coords_sorted[1:]:
-                if x - current_cluster[-1] < 50:
-                    current_cluster.append(x)
-                else:
-                    clusters.append(sum(current_cluster) / len(current_cluster))
-                    current_cluster = [x]
-            if current_cluster:
-                clusters.append(sum(current_cluster) / len(current_cluster))
-            
-            print(f"  체크박스 클러스터: {len(clusters)}개 발견")
-            
-            # 클러스터를 PANEL에 매핑
-            slot_names = ["no1", "no2", "bus", "emg"]
-            for i, cluster_x in enumerate(clusters[:4]):
-                if i < len(slot_names):
-                    slot = slot_names[i]
-                    if slot not in panel_positions:
-                        panel_positions[slot] = cluster_x
-                        print(f"  ✓ {slot} 추정 (cluster): X={cluster_x:.1f}")
-    
-    # X축 범위 계산
-    if not panel_positions:
-        print("[ERROR] PANEL 위치를 전혀 찾을 수 없습니다!")
+    if not checkboxes:
+        print("[ERROR] 체크박스가 없습니다!")
         return {}
     
-    sorted_panels = sorted(panel_positions.items(), key=lambda x: x[1])
-    panel_columns = {}
+    # 디버깅: Y 분포 확인
+    y_coords = [cb["y"] for cb in checkboxes]
+    print(f"  전체: {len(checkboxes)}개, Y범위: {min(y_coords):.1f}~{max(y_coords):.1f}")
+    print(f"  Y<100: {len([y for y in y_coords if y < 100])}개")
+    print(f"  Y<150: {len([y for y in y_coords if y < 150])}개")
+    print(f"  Y<200: {len([y for y in y_coords if y < 200])}개")
     
-    for idx, (slot, center_x) in enumerate(sorted_panels):
-        if idx > 0:
-            prev_x = sorted_panels[idx - 1][1]
-            x_min = (prev_x + center_x) / 2.0
+    # 상단 영역 선택 (Y < 150)
+    top_checkboxes = [cb for cb in checkboxes if cb["y"] < 150]
+    print(f"\n  → 선택: Y<150, {len(top_checkboxes)}개")
+    
+    if len(top_checkboxes) < 10:
+        print(f"[WARN] 부족 → Y<200 확대")
+        top_checkboxes = [cb for cb in checkboxes if cb["y"] < 200]
+        print(f"  → 재선택: {len(top_checkboxes)}개")
+    
+    if len(top_checkboxes) < 5:
+        print(f"[ERROR] 너무 적음 → 전체 사용")
+        top_checkboxes = checkboxes
+    
+    # X 좌표 추출 (중복 제거)
+    x_coords = sorted(set([cb["x"] for cb in top_checkboxes]))
+    print(f"  고유 X: {len(x_coords)}개, 범위: {min(x_coords):.1f}~{max(x_coords):.1f}")
+    
+    # 클러스터링 (50px threshold)
+    clusters = []
+    current = [x_coords[0]]
+    
+    for x in x_coords[1:]:
+        if x - current[-1] < 50:  # ← 핵심: 120→50
+            current.append(x)
         else:
-            x_min = center_x - 100.0
+            avg = sum(current) / len(current)
+            clusters.append((avg, len(current)))
+            current = [x]
+    
+    if current:
+        avg = sum(current) / len(current)
+        clusters.append((avg, len(current)))
+    
+    print(f"\n  클러스터: {len(clusters)}개")
+    for i, (x, cnt) in enumerate(clusters):
+        print(f"    [{i+1}] X={x:6.1f} ({cnt:2d}개)")
+    
+    cluster_centers = [c[0] for c in clusters]
+    
+    # 3단계: 매핑
+    if len(cluster_centers) < 4:
+        print(f"\n[WARN] {len(cluster_centers)}개만 발견 (4개 필요)")
+    
+    bus_x = panel_positions.get("bus")
+    emg_x = panel_positions.get("emg")
+    
+    print(f"\n[3단계] 매핑")
+    
+    slot_assignment = {}
+    remaining = list(cluster_centers)
+    
+    # BUS 매칭
+    if bus_x and remaining:
+        idx = min(range(len(remaining)), key=lambda i: abs(remaining[i] - bus_x))
+        slot_assignment["bus"] = remaining.pop(idx)
+        print(f"  ✓ bus: X={slot_assignment['bus']:.1f} (헤더:{bus_x:.1f})")
+    
+    # EMCY 매칭
+    if emg_x and remaining:
+        idx = min(range(len(remaining)), key=lambda i: abs(remaining[i] - emg_x))
+        slot_assignment["emg"] = remaining.pop(idx)
+        print(f"  ✓ emg: X={slot_assignment['emg']:.1f} (헤더:{emg_x:.1f})")
+    
+    # NO.1, NO.2 할당
+    remaining.sort()
+    if len(remaining) >= 1:
+        slot_assignment["no1"] = remaining[0]
+        print(f"  ✓ no1: X={slot_assignment['no1']:.1f}")
+        
+        # NO.2는 NO.1과 같은 위치 or 다음 클러스터
+        if len(remaining) >= 2:
+            slot_assignment["no2"] = remaining[1]
+            print(f"  ✓ no2: X={slot_assignment['no2']:.1f}")
+        else:
+            # 클러스터가 하나만 있으면 NO.1과 같은 위치로 설정
+            slot_assignment["no2"] = remaining[0]
+            print(f"  ✓ no2: X={slot_assignment['no2']:.1f} (no1과 동일 위치)")
+    
+    # 폴백
+    if "bus" not in slot_assignment and len(remaining) >= 1:
+        slot_assignment["bus"] = remaining.pop(0)
+        print(f"  ✓ bus(폴백): X={slot_assignment['bus']:.1f}")
+    if "emg" not in slot_assignment and len(remaining) >= 1:
+        slot_assignment["emg"] = remaining.pop(0)
+        print(f"  ✓ emg(폴백): X={slot_assignment['emg']:.1f}")
+    
+    # 4단계: 범위 계산
+    if not slot_assignment:
+        print("\n[ERROR] PANEL 없음!")
+        return {}
+    
+    print(f"\n[4단계] X축 범위")
+    
+    sorted_panels = sorted(slot_assignment.items(), key=lambda x: x[1])
+    panel_columns = {}
+    page_width = page.width
+    
+    for idx, (slot, cx) in enumerate(sorted_panels):
+        if idx > 0:
+            x_min = (sorted_panels[idx-1][1] + cx) / 2.0
+        else:
+            x_min = max(0, cx - 100)
         
         if idx < len(sorted_panels) - 1:
-            next_x = sorted_panels[idx + 1][1]
-            x_max = (center_x + next_x) / 2.0
+            x_max = (cx + sorted_panels[idx+1][1]) / 2.0
         else:
-            x_max = center_x + 100.0
+            x_max = min(page_width, cx + 100)
         
         panel_columns[slot] = (x_min, x_max)
+        print(f"  {slot:5s}: {x_min:6.1f} ~ {x_max:6.1f} (중심:{cx:6.1f}, 폭:{x_max-x_min:6.1f})")
+    
+    print("="*60 + "\n")
     
     return panel_columns
 
+
 def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
     """
-    ACB TYPE 추출 (HGN 63, HGN 10 등) - HGN 시리즈 전용
-    OCR Type(GPR-SA)과 명확히 구분하여 추출
-    AIR CIRCUIT BREAKER 섹션에서만 HGN 시리즈 찾기
+    ACB TYPE 추출 v9 - 숫자 크기 우선순위
+    1. HGN 숫자가 클수록 우선 (63 > 50 > 32 > 10)
+    2. 같은 숫자면 거리 가까운 것 선택
+    3. PANEL 범위 100px로 확대
     """
     words = page.extract_words() or []
     text = page.extract_text() or ""
     text_upper = text.upper()
     
-    # AIR CIRCUIT BREAKER 섹션 찾기 (ACB TYPE의 핵심 위치)
-    if "AIR CIRCUIT BREAKER" not in text_upper and "ACB TYPE" not in text_upper:
-        return ""
+    print(f"\n[DEBUG] ACB TYPE 추출 v9 (PANEL X: {x_min:.1f}~{x_max:.1f})")
     
-    # AIR CIRCUIT BREAKER 키워드의 Y 좌표 찾기
-    acb_section_y = None
+    # HGN 패턴 (매우 유연하게)
+    hgn_patterns = [
+        re.compile(r'\bHGN\s*(\d{2,3})[A-Z]?\b', re.I),     # HGN63, HGN 63, HGN10A
+        re.compile(r'\bHGN[-\s]*(\d{2,3})\b', re.I),        # HGN-63, HGN 63
+        re.compile(r'\b([H][G][N])(\d{2,3})\b', re.I),      # HGN63 (공백 없음)
+        re.compile(r'\bH\s*G\s*N\s*(\d{2,3})\b', re.I),     # H G N 63
+    ]
+    
+    # STEP 1: TYPE 행 찾기
+    type_row_y = None
     for word in words:
         word_text = (word.get("text") or "").strip().upper()
-        # "AIR CIRCUIT BREAKER" 또는 "ACB TYPE" 찾기
-        if ("AIR" in word_text and "CIRCUIT" in text_upper) or ("ACB" in word_text and "TYPE" in word_text):
-            acb_section_y = (word["top"] + word["bottom"]) / 2.0
+        if "TYPE" in word_text and ("MAKER" in word_text or "ACB" in text_upper):
+            type_row_y = (word["top"] + word["bottom"]) / 2.0
+            print(f"  [1] TYPE 행: Y={type_row_y:.1f}")
             break
     
-    if not acb_section_y:
-        return ""
+    if not type_row_y:
+        print(f"  [1] TYPE 행 없음 → Y=150 가정")
+        type_row_y = 150
     
-    # HGN 시리즈만 찾기 (GPR-SA는 OCR Type이므로 제외!)
-    hgn_pattern = re.compile(r'\bHGN\s*(\d{2})\b', re.I)
+    # STEP 1.5: TYPE 행 근처의 모든 단어 출력 (디버깅)
+    print(f"  [1.5] TYPE 행 근처 단어 스캔 (Y={type_row_y:.1f} ±50px):")
+    nearby_words = [
+        w for w in words
+        if abs((w["top"] + w["bottom"]) / 2.0 - type_row_y) < 50
+    ]
     
-    hgn_candidates = []
+    # PANEL 근처의 단어만 출력
+    panel_nearby = [
+        w for w in nearby_words
+        if (x_min - 100) <= ((w["x0"] + w["x1"]) / 2.0) <= (x_max + 100)
+    ]
+    
+    for w in panel_nearby[:20]:  # 최대 20개
+        wx = (w["x0"] + w["x1"]) / 2.0
+        wy = (w["top"] + w["bottom"]) / 2.0
+        word_text = (w.get("text") or "").strip()
+        print(f"       '{word_text}' at X={wx:.1f}, Y={wy:.1f}")
+    
+    # STEP 2: 모든 HGN 텍스트 수집
+    all_hgn = []
+    
+    # 방법 A: 단일 word에서 HGN 패턴 찾기
     for word in words:
-        wy = (word["top"] + word["bottom"]) / 2.0
         wx = (word["x0"] + word["x1"]) / 2.0
-        
-        # AIR CIRCUIT BREAKER 섹션 아래 150px 이내만 확인
-        if not (0 < (wy - acb_section_y) < 150):
-            continue
-        
-        # 해당 PANEL 영역 내 (여유있게 확인)
-        if not (x_min - 30 <= wx <= x_max + 30):
-            continue
-        
+        wy = (word["top"] + word["bottom"]) / 2.0
         word_text = (word.get("text") or "").strip()
-        match = hgn_pattern.search(word_text)
         
-        if match:
-            hgn_type = f"HGN {match.group(1)}"
-            hgn_candidates.append({
-                'text': hgn_type,
-                'x': wx,
-                'y': wy
-            })
+        for pattern in hgn_patterns:
+            match = pattern.search(word_text)
+            if match:
+                if len(match.groups()) == 2:  # ([H][G][N])(\d{2,3}) 패턴
+                    hgn_number = match.group(2)
+                else:
+                    hgn_number = match.group(1)
+                
+                hgn_type = f"HGN {hgn_number}"
+                all_hgn.append({
+                    'text': hgn_type,
+                    'x': wx,
+                    'y': wy,
+                    'dist_from_type': abs(wy - type_row_y),
+                    'source': 'single_word'
+                })
+                break
     
-    if not hgn_candidates:
-        print(f"    [DEBUG] HGN 후보를 찾을 수 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
+    # 방법 B: 인접한 단어 결합 (HGN과 숫자가 분리된 경우)
+    for i, word in enumerate(words):
+        word_text = (word.get("text") or "").strip().upper()
+        if word_text in ["HGN", "HG", "H"]:
+            # 다음 1~3개 단어 확인
+            for j in range(i + 1, min(i + 4, len(words))):
+                next_word = words[j]
+                next_text = (next_word.get("text") or "").strip()
+                
+                # 숫자인지 확인
+                if re.match(r'^\d{2,3}[A-Z]?$', next_text):
+                    wx = (word["x0"] + next_word["x1"]) / 2.0  # 중간점
+                    wy = (word["top"] + next_word["bottom"]) / 2.0
+                    
+                    hgn_type = f"HGN {next_text}"
+                    all_hgn.append({
+                        'text': hgn_type,
+                        'x': wx,
+                        'y': wy,
+                        'dist_from_type': abs(wy - type_row_y),
+                        'source': 'combined_words'
+                    })
+                    break
+    
+    print(f"  [2] 전체 HGN: {len(all_hgn)}개")
+    if all_hgn:
+        for h in all_hgn:
+            in_range = "✓" if (x_min - 300 <= h['x'] <= x_max + 300) else "✗"
+            print(f"      {in_range} {h['text']} at X={h['x']:.1f}, Y={h['y']:.1f} ({h['source']})")
+    
+    if not all_hgn:
+        print(f"  [ERROR] HGN 텍스트를 찾을 수 없습니다!")
+        print(f"  → TYPE 행 근처 단어를 확인하세요 (위 [1.5] 참고)")
         return ""
     
-    print(f"    [DEBUG] HGN 후보: {[c['text'] for c in hgn_candidates]}")
-    
-    # 체크박스가 있으면 체크박스와 가장 가까운 HGN 선택
+    # STEP 3: 체크박스 기반 매칭 (숫자 크기 우선 + 거리 보조)
     if checkboxes:
-        # ACB TYPE 행 근처의 체크박스 찾기 (범위 확대)
-        type_checkboxes = [
-            cb for cb in checkboxes 
-            if abs(cb['y'] - acb_section_y) < 100
-            and x_min - 30 <= cb['x'] <= x_max + 30
+        print(f"  [3] 전체 체크박스: {len(checkboxes)}개")
+        
+        # HGN 숫자 추출 함수
+        def extract_hgn_number(hgn_text):
+            match = re.search(r'(\d+)', hgn_text)
+            return int(match.group(1)) if match else 0
+        
+        # PANEL 영역의 체크박스 필터링 (점진적 확대)
+        for margin in [100, 150, 200, 300]:  # 100px부터 시작 (확대)
+            panel_checkboxes = [
+                cb for cb in checkboxes
+                if (x_min - margin) <= cb['x'] <= (x_max + margin)
+            ]
+            
+            if not panel_checkboxes:
+                continue
+            
+            print(f"  [3] PANEL 체크박스: {len(panel_checkboxes)}개 (margin={margin}px)")
+            
+            # 각 체크박스에 가장 가까운 HGN 찾기
+            candidates = []
+            
+            for cb in panel_checkboxes:
+                for hgn in all_hgn:
+                    dx = abs(hgn['x'] - cb['x'])
+                    dy = abs(hgn['y'] - cb['y'])
+                    
+                    # Y축 3배 가중치 (같은 행 우선)
+                    weighted_dist = ((dx ** 2) + ((dy * 3) ** 2)) ** 0.5
+                    
+                    # 조건: X축 250px 이내, Y축 30px 이내
+                    if dx < 250 and dy < 30:
+                        hgn_num = extract_hgn_number(hgn['text'])
+                        in_panel_tight = (x_min - 50) <= hgn['x'] <= (x_max + 50)
+                        in_panel_wide = (x_min - 100) <= hgn['x'] <= (x_max + 100)
+                        
+                        candidates.append({
+                            'hgn': hgn['text'],
+                            'hgn_num': hgn_num,
+                            'dist': weighted_dist,
+                            'dx': dx,
+                            'dy': dy,
+                            'hgn_x': hgn['x'],
+                            'in_panel_tight': in_panel_tight,
+                            'in_panel_wide': in_panel_wide,
+                        })
+            
+            if not candidates:
+                continue
+            
+            # 후보 출력 (디버깅) - 숫자 큰 순으로 정렬
+            print(f"      총 {len(candidates)}개 후보 (숫자 큰 순):")
+            sorted_candidates = sorted(candidates, key=lambda x: (-x['hgn_num'], x['dist']))
+            for c in sorted_candidates[:10]:
+                tight = "✓" if c['in_panel_tight'] else "✗"
+                wide = "✓" if c['in_panel_wide'] else "✗"
+                print(f"      {tight}/{wide} {c['hgn']} (거리={c['dist']:.1f}, dx={c['dx']:.1f}, dy={c['dy']:.1f}, 숫자={c['hgn_num']})")
+            
+            # 우선순위 1: PANEL 범위 내(±100px) + 가장 큰 숫자
+            wide_candidates = [c for c in candidates if c['in_panel_wide']]
+            
+            if wide_candidates:
+                # 숫자가 가장 큰 것들 중에서 거리가 가장 가까운 것
+                max_num = max(c['hgn_num'] for c in wide_candidates)
+                max_num_candidates = [c for c in wide_candidates if c['hgn_num'] == max_num]
+                best = min(max_num_candidates, key=lambda c: c['dist'])
+                
+                print(f"  [✓] PANEL 내 최대 숫자 선택: {best['hgn']} (거리={best['dist']:.1f}px, 숫자={best['hgn_num']})")
+                return best['hgn']
+            
+            # 우선순위 2: 타이트한 범위(±50px) 후보
+            tight_candidates = [c for c in candidates if c['in_panel_tight']]
+            
+            if tight_candidates:
+                max_num = max(c['hgn_num'] for c in tight_candidates)
+                max_num_candidates = [c for c in tight_candidates if c['hgn_num'] == max_num]
+                best = min(max_num_candidates, key=lambda c: c['dist'])
+                
+                print(f"  [✓] PANEL 타이트 범위 선택: {best['hgn']} (거리={best['dist']:.1f}px)")
+                return best['hgn']
+    
+    # STEP 4: PANEL 영역 직접 검색 (체크박스 실패 시)
+    print(f"  [4] 체크박스 매칭 실패 → PANEL 영역 직접 검색")
+    
+    # HGN 숫자 추출
+    def extract_number(hgn_text):
+        match = re.search(r'(\d+)', hgn_text)
+        return int(match.group(1)) if match else 0
+    
+    # PANEL 범위 확대 (200px까지)
+    for margin in [100, 150, 200, 300]:
+        panel_hgn = [
+            h for h in all_hgn
+            if (x_min - margin) <= h['x'] <= (x_max + margin)
         ]
         
-        print(f"    [DEBUG] 체크박스: {len(type_checkboxes)}개")
-        
-        if type_checkboxes:
-            best_match = None
-            min_dist = float('inf')
+        if panel_hgn:
+            print(f"      margin={margin}px: {len(panel_hgn)}개 HGN")
             
-            for cb in type_checkboxes:
-                for candidate in hgn_candidates:
-                    dist_x = abs(candidate['x'] - cb['x'])
-                    dist_y = abs(candidate['y'] - cb['y'])
-                    dist = (dist_x ** 2 + dist_y ** 2) ** 0.5
-                    
-                    # X축 거리가 80px 이내이고 전체 거리가 가장 가까운 것 선택
-                    if dist < min_dist and dist_x < 80:
-                        min_dist = dist
-                        best_match = candidate['text']
+            # 가장 큰 숫자의 HGN 선택 (63 > 50 > 32 > 10)
+            best = max(panel_hgn, key=lambda h: extract_number(h['text']))
+            best_num = extract_number(best['text'])
             
-            if best_match:
-                print(f"    [DEBUG] 체크박스 기반 선택: {best_match}")
-                return best_match
+            print(f"  [✓] PANEL 영역 선택 (최대 숫자): {best['text']} (X={best['x']:.1f}, 숫자={best_num})")
+            return best['text']
     
-    # 체크박스가 없거나 매칭 실패 시 첫 번째 HGN 후보 반환
-    print(f"    [DEBUG] 기본값 선택: {hgn_candidates[0]['text']}")
-    return hgn_candidates[0]['text']
+    print(f"  [✗] PANEL 범위 내에 HGN이 없습니다!")
+    return ""
+
+
 
 def _extract_ocr_type(page) -> str:
     """
