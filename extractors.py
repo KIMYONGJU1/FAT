@@ -157,42 +157,17 @@ PANEL_SLOT_SPECS = [
     {
         "slot": "no1",
         "title": "No.1 INCOMING PANEL",
-        # NO.1 / NO1 / NO.1&2 등 다양한 표기 대응
-        "aliases": [
-            "NO1INCOMING",
-            "NO1INCOMINGPANEL",
-            "NO1MAININCOMING",
-            "NO1",
-            "NO01",
-            "NO.1",
-            "NO12",           # "NO.1&2" → "NO12" 로 인식되는 경우
-        ],
+        "aliases": ["NO1INCOMING", "NO1INCOMINGPANEL", "NO1MAININCOMING"],
     },
     {
         "slot": "no2",
         "title": "No.2 INCOMING PANEL",
-        # NO.2 / NO2 / NO.1&2 등 다양한 표기 대응
-        "aliases": [
-            "NO2INCOMING",
-            "NO2INCOMINGPANEL",
-            "NO2MAININCOMING",
-            "NO2",
-            "NO02",
-            "NO.2",
-            "NO12",           # "NO.1&2" 공용 열인 경우 no1 / no2 둘 다 이 좌표 사용
-        ],
+        "aliases": ["NO2INCOMING", "NO2INCOMINGPANEL", "NO2MAININCOMING"],
     },
     {
         "slot": "bus",
         "title": "BUS-TIE",
-        # BUS TIE 가 두 단어로 나뉘는 케이스까지 고려
-        "aliases": [
-            "BUSTIE",
-            "BUSTIEPANEL",
-            "BUSTIESWBD",
-            "BUSTIESWITCHBOARD",
-            "BUS",            # "BUS TIE" 에서 BUS 단어만 잡히는 경우
-        ],
+        "aliases": ["BUSTIE", "BUSTIEPANEL", "BUSTIESWBD", "BUSTIESWITCHBOARD"],
     },
     {
         "slot": "emg",
@@ -202,12 +177,9 @@ PANEL_SLOT_SPECS = [
             "EMERCYSWITCHBOARD",
             "LINKTOEMCYSWITCHBOARD",
             "LINKTOEMERGENCYSWITCHBOARD",
-            "EMCY",           # "EMCY SWITCHBOARD" 같은 표기 대응
-            "EMERGENCYSWBD",
         ],
     },
 ]
-
 
 PANEL_ROW_MARKERS = {
     "acb_type": [r"ACB\s*(TYPE|MODEL)", r"AIR\s+CIRCUIT\s+BREAKER"],
@@ -431,81 +403,141 @@ def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
             cy = (rect["top"] + rect["bottom"]) / 2.0
             checkboxes.append({"x": cx, "y": cy})
     
-    preview = ", ".join(f"({c['x']:.1f}, {c['y']:.1f})" for c in checkboxes[:5])
-    print(f"\n체크박스 좌표: {preview}")
+    print(f"  체크박스 좌표: {[(f'({c['x']:.1f}, {c['y']:.1f})') for c in checkboxes[:5]]}")
     return checkboxes
 
 def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
     """
-    PANEL 헤더 텍스트와 체크박스 위치로 각 PANEL의 X축 범위 결정
+    PANEL 헤더 텍스트와 체크박스 위치로 각 PANEL의 X축 범위 결정 (개선 버전)
     """
     words = page.extract_words() or []
-    panel_positions: Dict[str, float] = {}
-
-    # 1단계: PANEL_SLOT_SPECS 의 alias 로 헤더 위치 찾기
+    text = page.extract_text() or ""
+    panel_positions = {}
+    
+    print("[DEBUG] PANEL 텍스트 검색 중...")
+    
+    # 방법1: 기존 aliases로 찾기
     for spec in PANEL_SLOT_SPECS:
-        slot = spec["slot"]
-        aliases = spec.get("aliases", [])
-
         for word in words:
-            text = (word.get("text") or "").strip().upper()
-            if not text:
-                continue
-            # 공백/기호 제거 후 비교
-            text_norm = re.sub(r"[^A-Z0-9]", "", text)
-
-            for alias in aliases:
-                if alias and alias in text_norm:
+            text_word = (word.get("text") or "").strip().upper()
+            text_norm = re.sub(r'[^A-Z0-9]', '', text_word)
+            
+            for alias in spec["aliases"]:
+                if alias in text_norm:
                     cx = (word["x0"] + word["x1"]) / 2.0
-                    panel_positions[slot] = cx
+                    if spec["slot"] not in panel_positions:
+                        panel_positions[spec["slot"]] = cx
+                        print(f"  ✓ {spec['slot']} 발견 (alias): {text_word} at X={cx:.1f}")
                     break
-
+            if spec["slot"] in panel_positions:
+                break
+    
+    # 방법2: 특정 패턴으로 찾기 (EMERGENCY 패턴 강화)
+    patterns = {
+        "no1": [
+            r'NO\.?\s*1.*INCOMING',
+            r'P11-007-01A-PN',
+            r'NO\.?1&2.*INCOMING',
+            r'NO\.?\s*1\s*INCOMING\s*PANEL'
+        ],
+        "no2": [
+            r'NO\.?\s*2.*INCOMING',
+            r'P12-007-01A-PN',
+            r'NO\.?\s*2\s*INCOMING\s*PANEL'
+        ],
+        "bus": [
+            r'BUS[\s\-]*TIE',
+            r'BUS\s*TIE\s*PANEL',
+            r'BUSTIE'
+        ],
+        "emg": [
+            r'LINK.*EMC?Y',
+            r'EMERGENCY.*PANEL',
+            r'P31-003-11-PN',
+            r'LINK\s*TO\s*EMC?Y',
+            r'EMC?Y\s*SWITCHBOARD',
+            r'LINK\s*TO\s*EMERGENCY',
+            r'LINK.*SWITCHBOARD'
+        ]
+    }
+    
+    for slot, pats in patterns.items():
+        if slot in panel_positions:
+            continue
+        
+        for pattern in pats:
+            matches = re.finditer(pattern, text.upper())
+            for match in matches:
+                # 매칭된 텍스트의 위치 찾기
+                matched_text = match.group(0)
+                for word in words:
+                    if matched_text in (word.get("text") or "").upper():
+                        cx = (word["x0"] + word["x1"]) / 2.0
+                        panel_positions[slot] = cx
+                        print(f"  ✓ {slot} 발견 (pattern): {matched_text} at X={cx:.1f}")
+                        break
+                if slot in panel_positions:
+                    break
             if slot in panel_positions:
                 break
-
-    # 1-보강: alias 로 BUS 를 못 찾았을 때 "BUS" + "TIE" 가 같은 줄에 있는지 검사
-    if "bus" not in panel_positions:
-        # y 기준으로 같은 줄에 있는 단어끼리 묶기
-        lines_by_y: Dict[float, List[dict]] = {}
-        for w in words:
-            y_center = round((w["top"] + w["bottom"]) / 2.0, 1)
-            lines_by_y.setdefault(y_center, []).append(w)
-
-        for line_words in lines_by_y.values():
-            texts = [(w.get("text") or "").strip().upper() for w in line_words]
-            if "BUS" in texts and "TIE" in texts:
-                xs = [
-                    (w["x0"] + w["x1"]) / 2.0
-                    for w in line_words
-                    if (w.get("text") or "").strip().upper() in ("BUS", "TIE")
-                ]
-                if xs:
-                    panel_positions["bus"] = sum(xs) / len(xs)
-                break
-
-    # 2단계: X축 범위 계산
+    
+    # 방법3: 체크박스 X 좌표 클러스터링으로 추정
+    if len(panel_positions) < 3:
+        print("[DEBUG] PANEL 텍스트 부족, 체크박스 클러스터링 시도...")
+        
+        # 체크박스 X 좌표 수집
+        x_coords = [cb["x"] for cb in checkboxes]
+        if x_coords:
+            x_coords_sorted = sorted(set(x_coords))
+            
+            # X 좌표를 그룹으로 묶기 (50px 이내는 같은 그룹)
+            clusters = []
+            current_cluster = [x_coords_sorted[0]]
+            
+            for x in x_coords_sorted[1:]:
+                if x - current_cluster[-1] < 50:
+                    current_cluster.append(x)
+                else:
+                    clusters.append(sum(current_cluster) / len(current_cluster))
+                    current_cluster = [x]
+            if current_cluster:
+                clusters.append(sum(current_cluster) / len(current_cluster))
+            
+            print(f"  체크박스 클러스터: {len(clusters)}개 발견")
+            
+            # 클러스터를 PANEL에 매핑
+            slot_names = ["no1", "no2", "bus", "emg"]
+            for i, cluster_x in enumerate(clusters[:4]):
+                if i < len(slot_names):
+                    slot = slot_names[i]
+                    if slot not in panel_positions:
+                        panel_positions[slot] = cluster_x
+                        print(f"  ✓ {slot} 추정 (cluster): X={cluster_x:.1f}")
+    
+    # X축 범위 계산
+    if not panel_positions:
+        print("[ERROR] PANEL 위치를 전혀 찾을 수 없습니다!")
+        return {}
+    
     sorted_panels = sorted(panel_positions.items(), key=lambda x: x[1])
-    panel_columns: Dict[str, Tuple[float, float]] = {}
-
+    panel_columns = {}
+    
     for idx, (slot, center_x) in enumerate(sorted_panels):
-        # 왼쪽 경계
         if idx > 0:
             prev_x = sorted_panels[idx - 1][1]
             x_min = (prev_x + center_x) / 2.0
         else:
             x_min = center_x - 100.0
-
-        # 오른쪽 경계
+        
         if idx < len(sorted_panels) - 1:
             next_x = sorted_panels[idx + 1][1]
             x_max = (center_x + next_x) / 2.0
         else:
             x_max = center_x + 100.0
-
+        
         panel_columns[slot] = (x_min, x_max)
-
+    
     return panel_columns
-
 
 def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
     """
@@ -925,157 +957,115 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
     return ""
 
 def extract_acb_setting_panels(msbd_pdf: str) -> List[Dict[str, str]]:
-    """
-    ACB SETTING TABLE에서 체크박스 기반으로 PANEL 정보 추출
-    """
+    """ACB SETTING TABLE에서 체크박스 기반으로 PANEL 정보 추출 - 범용성 개선"""
     base_records = _blank_panel_records()
     if not (msbd_pdf and os.path.exists(msbd_pdf)):
         return base_records
-
+    
     try:
         with pdfplumber.open(msbd_pdf) as pdf:
             _, page = _find_acb_setting_page(pdf)
             if page is None:
                 print("[WARN] ACB SETTING TABLE 페이지를 찾을 수 없습니다.")
                 return base_records
-
-            print(f"\n{'=' * 60}")
-            print("ACB SETTING TABLE 파싱 시작")
-            print(f"{'=' * 60}\n")
-
-            # 1단계: 체크박스 찾기
+            
+            print(f"\n{'='*60}")
+            print(f"ACB SETTING TABLE 파싱 시작")
+            print(f"{'='*60}\n")
+            
+            # 1단계: 체크박스 위치 찾기
             checkboxes = _find_filled_checkboxes(page)
-            print(f"\n체크박스 좌표: {[f'({c[\"x\"]:.1f}, {c[\"y\"]:.1f})' for c in checkboxes[:5]]}")
             print(f"[STEP 1] 체크박스 감지: {len(checkboxes)}개 발견")
-
+            
+            if not checkboxes:
+                print("[WARN] 체크박스를 찾을 수 없습니다.")
+            
             # 2단계: PANEL 컬럼 영역 결정
             panel_columns = _determine_panel_columns(page, checkboxes)
-            print(f"[STEP 2] PANEL 컬럼 매핑:")
+            print(f"[STEP 2] PANEL 컬럼 매핑: {len(panel_columns)}개")
             for slot, (x_min, x_max) in panel_columns.items():
                 print(f"  • {slot:10s} → X: {x_min:.1f} ~ {x_max:.1f}")
-
+            
+            if not panel_columns:
+                print("[ERROR] PANEL 위치를 찾을 수 없습니다. 기본값 반환.")
+                return base_records
+            
             # 3단계: 행별 정보 추출
             record_map = {rec["slot"]: rec for rec in base_records}
-
-            # TYPE 추출 (GPR-SA 등, 모든 PANEL 공통)
-            type_value = _extract_type_value(page)
-            print(f"\n[STEP 3] TYPE 추출: {type_value}")
-
-            # 각 PANEL별로 체크박스가 있는 항목 추출
+            
+            # OCR TYPE 추출 (모든 PANEL 공통)
+            ocr_type_value = _extract_ocr_type(page)
+            print(f"\n[STEP 3] OCR TYPE 추출: {ocr_type_value or '(없음)'}")
+            
+            # 각 PANEL별로 추출
             for slot, (x_min, x_max) in panel_columns.items():
                 record = record_map.get(slot)
                 if not record:
                     continue
-
+                
                 print(f"\n[{slot}] 추출 중...")
-
-                # TYPE (ACB Type) 공통 적용
-                if type_value:
-                    record["acb_type"] = type_value
-
-                # OCR TYPE 추출
-                ocr = _extract_ocr_type(page, x_min, x_max, checkboxes)
-                if ocr:
-                    record["ocr_type"] = ocr
-                    print(f"  OCR Type: {ocr}")
-
-                # AMPERE FRAME 추출 (체크박스 기반)
-                frame = _extract_checked_value(
-                    page, x_min, x_max, checkboxes, "AMPERE FRAME", "FRAME"
-                )
+                
+                # ACB TYPE 추출 (HGN 시리즈 등)
+                acb_type = _extract_acb_type(page, x_min, x_max, checkboxes)
+                if acb_type:
+                    record["acb_type"] = acb_type
+                    print(f"  ACB Type: {acb_type}")
+                else:
+                    print(f"  ACB Type: (추출 실패)")
+                
+                # OCR TYPE (공통값)
+                if ocr_type_value:
+                    record["ocr_type"] = ocr_type_value
+                    print(f"  OCR Type: {ocr_type_value}")
+                else:
+                    print(f"  OCR Type: (추출 실패)")
+                
+                # AMPERE FRAME 추출
+                frame = _extract_ampere_frame(page, x_min, x_max, checkboxes)
                 if frame:
                     record["ampere_frame"] = frame
                     print(f"  Ampere Frame: {frame}")
-
+                else:
+                    print(f"  Ampere Frame: (추출 실패)")
+                
                 # RATED CURRENT 추출
                 rated = _extract_rated_current(page, x_min, x_max)
                 if rated:
                     record["rated_current_in"] = rated
                     print(f"  Rated Current: {rated}")
-
-                # IR (%) 추출 (RANGE 행에서 체크박스 기반)
-                ir_pct = _extract_checked_value(
-                    page,
-                    x_min,
-                    x_max,
-                    checkboxes,
-                    "PICK UP",
-                    "RANGE",
-                    value_type="decimal",
-                )
+                else:
+                    print(f"  Rated Current: (추출 실패)")
+                
+                # IR (%) 추출 (LTD RANGE)
+                ir_pct = _extract_ir_percent(page, x_min, x_max, checkboxes)
                 if ir_pct:
                     record["ir_percent"] = ir_pct
                     print(f"  IR (%): {ir_pct}")
-
-                # IR (A) 계산 (rated_current * ir_percent)
+                else:
+                    print(f"  IR (%): (추출 실패)")
+                
+                # IR (A) 계산
                 if record["rated_current_in"] and record["ir_percent"]:
                     try:
-                        rated_val = float(
-                            re.sub(r"[^0-9.]", "", record["rated_current_in"])
-                        )
+                        rated_val = float(re.sub(r'[^0-9.]', '', record["rated_current_in"]))
                         ir_pct_val = float(record["ir_percent"])
                         ir_amps = int(rated_val * ir_pct_val)
                         record["ir_amps"] = str(ir_amps)
                         print(f"  IR (A): {ir_amps}")
-                    except Exception:
-                        pass
-
-            # --- BUS-TIE Fallback: BUS 패널이 비어 있으면 INCOMING 값 복사 ---
-            def _is_panel_empty(rec: Optional[Dict[str, str]]) -> bool:
-                if not rec:
-                    return True
-                for key in (
-                    "acb_type",
-                    "ocr_type",
-                    "ampere_frame",
-                    "rated_current_in",
-                    "ir_percent",
-                    "ir_amps",
-                ):
-                    if rec.get(key):
-                        return False
-                return True
-
-            bus_rec = record_map.get("bus")
-            no1_rec = record_map.get("no1")
-            no2_rec = record_map.get("no2")
-
-            if _is_panel_empty(bus_rec):
-                # 우선 no2, 그다음 no1 값 사용
-                src = None
-                if not _is_panel_empty(no2_rec):
-                    src = no2_rec
-                elif not _is_panel_empty(no1_rec):
-                    src = no1_rec
-
-                if src and bus_rec is not None:
-                    print(
-                        "\n[BUS] BUS-TIE 정보가 없어 INCOMING 패널 값으로 자동 채웁니다."
-                    )
-                    for key in (
-                        "acb_type",
-                        "ocr_type",
-                        "ampere_frame",
-                        "rated_current_in",
-                        "ir_percent",
-                        "ir_amps",
-                    ):
-                        if src.get(key):
-                            bus_rec[key] = src[key]
-
-            print(f"\n{'=' * 60}")
-            print("ACB SETTING TABLE 파싱 완료")
-            print(f"{'=' * 60}\n")
-
+                    except Exception as e:
+                        print(f"  IR (A): 계산 실패 ({e})")
+            
+            print(f"\n{'='*60}")
+            print(f"ACB SETTING TABLE 파싱 완료")
+            print(f"{'='*60}\n")
+            
             return base_records
-
+            
     except Exception as e:
         print(f"[ERROR] ACB SETTING TABLE 파싱 실패: {e}")
         import traceback
-
         traceback.print_exc()
         return base_records
-
 
 def _extract_ir_percent(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
     """
