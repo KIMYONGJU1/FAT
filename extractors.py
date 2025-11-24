@@ -403,7 +403,8 @@ def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
             cy = (rect["top"] + rect["bottom"]) / 2.0
             checkboxes.append({"x": cx, "y": cy})
     
-    print(f"  체크박스 좌표: {[(f'({c['x']:.1f}, {c['y']:.1f})') for c in checkboxes[:5]]}")
+    coords_preview = [f"({c['x']:.1f}, {c['y']:.1f})" for c in checkboxes[:5]]
+    print(f"  체크박스 좌표: {coords_preview}")
     return checkboxes
 
 def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
@@ -518,8 +519,21 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
     if not panel_positions:
         print("[ERROR] PANEL 위치를 전혀 찾을 수 없습니다!")
         return {}
-    
+
     sorted_panels = sorted(panel_positions.items(), key=lambda x: x[1])
+
+    # BUS-TIE가 누락된 경우, No.1/No.2 사이 중간 위치로 보간
+    slot_to_center = {slot: cx for slot, cx in sorted_panels}
+    if "bus" not in slot_to_center:
+        c1, c2 = slot_to_center.get("no1"), slot_to_center.get("no2")
+        if c1 and c2:
+            cx = (c1 + c2) / 2.0
+            span = abs(c2 - c1) / 3.0 if abs(c2 - c1) > 0 else 120.0
+            panel_positions["bus"] = cx
+            sorted_panels.append(("bus", cx))
+            sorted_panels = sorted(sorted_panels, key=lambda x: x[1])
+            print(f"  ✓ bus 보간: X={cx:.1f} (span≈{span:.1f})")
+
     panel_columns = {}
     
     for idx, (slot, center_x) in enumerate(sorted_panels):
@@ -1777,29 +1791,58 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
+    color_keywords = {
+        "RED", "PINK", "BROWN", "BLUE", "GREEN", "YELLOW", "GOLDEN", "SILVER",
+        "PURPLE", "ORANGE", "WHITE", "BLACK", "LIGHT", "DARK", "NAVY", "GREY", "GRAY",
+    }
+
+    def _pick_color(cells: List[str]) -> str:
+        for cell in cells:
+            words = [w for w in re.split(r'[^A-Z]', cell.upper()) if w]
+            for w in words:
+                if w in color_keywords:
+                    return w
+        return ""
+
     for row in table:
         if not row:
             continue
-        
+
+        normalized_row = [str(cell or "").strip() for cell in row]
+        normalized_upper = [cell.upper() for cell in normalized_row]
+
         found_code = None
-        for cell in row:
-            if not cell:
-                continue
-            cell_text = str(cell).strip().upper()
+        code_col_idx = None
+        for col_idx, cell_text in enumerate(normalized_upper):
             for pattern in emergency_patterns:
                 match = pattern.search(cell_text)
                 if match:
                     found_code = match.group(1).upper()
+                    code_col_idx = col_idx
                     if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
                         found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
                     break
             if found_code:
                 break
-        
-        if found_code:
-            code_map[found_code] = {"color": "", "name": ""}
-    
+
+        if not found_code:
+            continue
+
+        before_cells = normalized_upper[:code_col_idx] if code_col_idx is not None else []
+        after_cells = normalized_row[code_col_idx + 1 :] if code_col_idx is not None else []
+
+        color = _pick_color(before_cells) or _pick_color(after_cells)
+
+        name_candidates = [
+            cell for cell in after_cells
+            if cell and len(cell) > 1 and not re.search(r'\b(CODE|COLOR|COLOUR)\b', cell, flags=re.I)
+            and not re.search(r'ES-?\d+|CO2-?\d+|FOAM-?\d+|PT-?\d+', cell, flags=re.I)
+        ]
+        name = max(name_candidates, key=len).strip(" :-·().") if name_candidates else ""
+
+        code_map[found_code] = {"color": color, "name": name}
+
     return code_map
 
 
