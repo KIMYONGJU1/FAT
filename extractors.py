@@ -403,7 +403,8 @@ def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
             cy = (rect["top"] + rect["bottom"]) / 2.0
             checkboxes.append({"x": cx, "y": cy})
     
-    print(f"  체크박스 좌표: {[(f'({c['x']:.1f}, {c['y']:.1f})') for c in checkboxes[:5]]}")
+    coords_preview = [f"({c['x']:.1f}, {c['y']:.1f})" for c in checkboxes[:5]]
+    print(f"  체크박스 좌표: {coords_preview}")
     return checkboxes
 
 def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
@@ -518,8 +519,31 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
     if not panel_positions:
         print("[ERROR] PANEL 위치를 전혀 찾을 수 없습니다!")
         return {}
-    
+
     sorted_panels = sorted(panel_positions.items(), key=lambda x: x[1])
+
+    # BUS-TIE가 누락된 경우, No.1/No.2 사이 중간 위치로 보간
+    slot_to_center = {slot: cx for slot, cx in sorted_panels}
+    if "bus" not in slot_to_center:
+        c1, c2 = slot_to_center.get("no1"), slot_to_center.get("no2")
+        if c1 and c2:
+            cx = (c1 + c2) / 2.0
+            span = abs(c2 - c1) / 3.0 if abs(c2 - c1) > 0 else 120.0
+            panel_positions["bus"] = cx
+            sorted_panels.append(("bus", cx))
+            sorted_panels = sorted(sorted_panels, key=lambda x: x[1])
+            print(f"  ✓ bus 보간: X={cx:.1f} (span≈{span:.1f})")
+        elif len(sorted_panels) >= 2:
+            # 전체 테이블 폭을 균등 분할하여 BUS-TIE 대략 위치 지정
+            xs = [cx for _, cx in sorted_panels]
+            span = max(xs) - min(xs)
+            if span > 0:
+                cx = min(xs) + span / 2.0
+                panel_positions["bus"] = cx
+                sorted_panels.append(("bus", cx))
+                sorted_panels = sorted(sorted_panels, key=lambda x: x[1])
+                print(f"  ✓ bus 균등 분할 추정: X={cx:.1f}")
+
     panel_columns = {}
     
     for idx, (slot, center_x) in enumerate(sorted_panels):
@@ -551,19 +575,21 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
     
     # AIR CIRCUIT BREAKER 섹션 찾기 (ACB TYPE의 핵심 위치)
     if "AIR CIRCUIT BREAKER" not in text_upper and "ACB TYPE" not in text_upper:
-        return ""
-    
-    # AIR CIRCUIT BREAKER 키워드의 Y 좌표 찾기
-    acb_section_y = None
-    for word in words:
-        word_text = (word.get("text") or "").strip().upper()
-        # "AIR CIRCUIT BREAKER" 또는 "ACB TYPE" 찾기
-        if ("AIR" in word_text and "CIRCUIT" in text_upper) or ("ACB" in word_text and "TYPE" in word_text):
-            acb_section_y = (word["top"] + word["bottom"]) / 2.0
-            break
-    
+        # 이름plate가 불분명할 때는 행 마커 기반 탐색으로 바로 이동
+        acb_section_y = None
+    else:
+        # AIR CIRCUIT BREAKER 키워드의 Y 좌표 찾기
+        acb_section_y = None
+        for word in words:
+            word_text = (word.get("text") or "").strip().upper()
+            # "AIR CIRCUIT BREAKER" 또는 "ACB TYPE" 찾기
+            if ("AIR" in word_text and "CIRCUIT" in text_upper) or ("ACB" in word_text and "TYPE" in word_text):
+                acb_section_y = (word["top"] + word["bottom"]) / 2.0
+                break
+
+    row_markers = _row_positions_from_words(words)
     if not acb_section_y:
-        return ""
+        acb_section_y = row_markers.get("acb_type")
     
     # HGN 시리즈만 찾기 (GPR-SA는 OCR Type이므로 제외!)
     hgn_pattern = re.compile(r'\bHGN\s*(\d{2})\b', re.I)
@@ -592,45 +618,65 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
                 'y': wy
             })
     
-    if not hgn_candidates:
-        print(f"    [DEBUG] HGN 후보를 찾을 수 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
-        return ""
-    
-    print(f"    [DEBUG] HGN 후보: {[c['text'] for c in hgn_candidates]}")
-    
-    # 체크박스가 있으면 체크박스와 가장 가까운 HGN 선택
-    if checkboxes:
-        # ACB TYPE 행 근처의 체크박스 찾기 (범위 확대)
-        type_checkboxes = [
-            cb for cb in checkboxes 
-            if abs(cb['y'] - acb_section_y) < 100
-            and x_min - 30 <= cb['x'] <= x_max + 30
-        ]
-        
-        print(f"    [DEBUG] 체크박스: {len(type_checkboxes)}개")
-        
-        if type_checkboxes:
-            best_match = None
-            min_dist = float('inf')
-            
-            for cb in type_checkboxes:
-                for candidate in hgn_candidates:
-                    dist_x = abs(candidate['x'] - cb['x'])
-                    dist_y = abs(candidate['y'] - cb['y'])
-                    dist = (dist_x ** 2 + dist_y ** 2) ** 0.5
-                    
-                    # X축 거리가 80px 이내이고 전체 거리가 가장 가까운 것 선택
-                    if dist < min_dist and dist_x < 80:
-                        min_dist = dist
-                        best_match = candidate['text']
-            
-            if best_match:
-                print(f"    [DEBUG] 체크박스 기반 선택: {best_match}")
-                return best_match
-    
-    # 체크박스가 없거나 매칭 실패 시 첫 번째 HGN 후보 반환
-    print(f"    [DEBUG] 기본값 선택: {hgn_candidates[0]['text']}")
-    return hgn_candidates[0]['text']
+    if hgn_candidates:
+        print(f"    [DEBUG] HGN 후보: {[c['text'] for c in hgn_candidates]}")
+
+        # 체크박스가 있으면 체크박스와 가장 가까운 HGN 선택
+        if checkboxes:
+            # ACB TYPE 행 근처의 체크박스 찾기 (범위 확대)
+            type_checkboxes = [
+                cb for cb in checkboxes
+                if abs(cb['y'] - (acb_section_y or cb['y'])) < 100
+                and x_min - 30 <= cb['x'] <= x_max + 30
+            ]
+
+            print(f"    [DEBUG] 체크박스: {len(type_checkboxes)}개")
+
+            if type_checkboxes:
+                best_match = None
+                min_dist = float('inf')
+
+                for cb in type_checkboxes:
+                    for candidate in hgn_candidates:
+                        dist_x = abs(candidate['x'] - cb['x'])
+                        dist_y = abs(candidate['y'] - cb['y'])
+                        dist = (dist_x ** 2 + dist_y ** 2) ** 0.5
+
+                        # X축 거리가 80px 이내이고 전체 거리가 가장 가까운 것 선택
+                        if dist < min_dist and dist_x < 80:
+                            min_dist = dist
+                            best_match = candidate['text']
+
+                if best_match:
+                    print(f"    [DEBUG] 체크박스 기반 선택: {best_match}")
+                    return best_match
+
+        # 체크박스가 없거나 매칭 실패 시 PANEL 중심과 가장 가까운 HGN 후보 반환
+        best = min(hgn_candidates, key=lambda c: abs(c['x'] - (x_min + x_max) / 2.0))
+        print(f"    [DEBUG] 기본값 선택: {best['text']}")
+        return best['text']
+
+    # 일반 텍스트 기반 추출 (ACB TYPE 행 근처의 가장 긴 단어 선택)
+    band_y = acb_section_y if acb_section_y else row_markers.get("acb_type")
+    candidate_words = _words_in_band(words, x_min - 10, x_max + 10, band_y, band=35.0)
+    cleaned: List[str] = []
+    for w in candidate_words:
+        t = (w.get("text") or "").strip()
+        t_norm = re.sub(r'[^A-Z0-9\- ]', '', t.upper()).strip()
+        if not t_norm:
+            continue
+        if any(bad in t_norm for bad in ["OCR", "TRIP", "LTD", "IR", "AF", "AMPERE", "RATED", "CURRENT", "TYPE"]):
+            continue
+        if 2 <= len(t_norm) <= 12:
+            cleaned.append(t_norm)
+
+    if cleaned:
+        best = max(cleaned, key=len)
+        print(f"    [DEBUG] HGN 미검출 - 일반 텍스트 사용: {best}")
+        return best
+
+    print(f"    [DEBUG] ACB TYPE 후보를 찾을 수 없음 (PANEL X: {x_min:.1f}~{x_max:.1f})")
+    return ""
 
 def _extract_ocr_type(page) -> str:
     """
@@ -1777,29 +1823,58 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
+    color_keywords = {
+        "RED", "PINK", "BROWN", "BLUE", "GREEN", "YELLOW", "GOLDEN", "SILVER",
+        "PURPLE", "ORANGE", "WHITE", "BLACK", "LIGHT", "DARK", "NAVY", "GREY", "GRAY",
+    }
+
+    def _pick_color(cells: List[str]) -> str:
+        for cell in cells:
+            words = [w for w in re.split(r'[^A-Z]', cell.upper()) if w]
+            for w in words:
+                if w in color_keywords:
+                    return w
+        return ""
+
     for row in table:
         if not row:
             continue
-        
+
+        normalized_row = [str(cell or "").strip() for cell in row]
+        normalized_upper = [cell.upper() for cell in normalized_row]
+
         found_code = None
-        for cell in row:
-            if not cell:
-                continue
-            cell_text = str(cell).strip().upper()
+        code_col_idx = None
+        for col_idx, cell_text in enumerate(normalized_upper):
             for pattern in emergency_patterns:
                 match = pattern.search(cell_text)
                 if match:
                     found_code = match.group(1).upper()
+                    code_col_idx = col_idx
                     if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
                         found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
                     break
             if found_code:
                 break
-        
-        if found_code:
-            code_map[found_code] = {"color": "", "name": ""}
-    
+
+        if not found_code:
+            continue
+
+        before_cells = normalized_upper[:code_col_idx] if code_col_idx is not None else []
+        after_cells = normalized_row[code_col_idx + 1 :] if code_col_idx is not None else []
+
+        color = _pick_color(before_cells) or _pick_color(after_cells)
+
+        name_candidates = [
+            cell for cell in after_cells
+            if cell and len(cell) > 1 and not re.search(r'\b(CODE|COLOR|COLOUR)\b', cell, flags=re.I)
+            and not re.search(r'ES-?\d+|CO2-?\d+|FOAM-?\d+|PT-?\d+', cell, flags=re.I)
+        ]
+        name = max(name_candidates, key=len).strip(" :-·().") if name_candidates else ""
+
+        code_map[found_code] = {"color": color, "name": name}
+
     return code_map
 
 
@@ -1943,6 +2018,10 @@ def _parse_emergency_circuit_table(
         re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
     ]
+    color_keywords = {
+        "RED", "PINK", "BROWN", "BLUE", "GREEN", "YELLOW", "GOLDEN", "SILVER",
+        "PURPLE", "ORANGE", "WHITE", "BLACK", "LIGHT", "DARK", "NAVY", "GREY", "GRAY",
+    }
     
     for row_idx in range(header_idx + 1, len(table)):
         row = table[row_idx]
@@ -1963,8 +2042,11 @@ def _parse_emergency_circuit_table(
             continue
         
         code_from_remarks = ""
+        color_hint = ""
+        remark_name = ""
         if remarks_col is not None and remarks_col < len(row):
-            remarks_text = str(row[remarks_col] or '').strip().upper()
+            remarks_raw = str(row[remarks_col] or '').strip()
+            remarks_text = remarks_raw.upper()
             for pattern in emergency_code_patterns:
                 match = pattern.search(remarks_text)
                 if match:
@@ -1972,6 +2054,19 @@ def _parse_emergency_circuit_table(
                     if '-' not in code_from_remarks and re.match(r'[A-Z]{2,4}\d+', code_from_remarks):
                         code_from_remarks = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code_from_remarks)
                     break
+
+            for word in re.split(r'[^A-Z]', remarks_text):
+                if word in color_keywords:
+                    color_hint = word
+                    break
+
+            cleaned = remarks_raw
+            if code_from_remarks:
+                cleaned = re.sub(re.escape(code_from_remarks), "", cleaned, flags=re.I)
+            cleaned = re.sub(r'\b(' + '|'.join(color_keywords) + r')\b', '', cleaned, flags=re.I)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip(" :-·().")
+            if cleaned and len(cleaned) > 3:
+                remark_name = cleaned
         
         if not code_from_remarks:
             continue
@@ -1998,18 +2093,22 @@ def _parse_emergency_circuit_table(
                 'circuit_name': circuit_name,
                 'panel': panel_name,
                 'doc_type': doc_type,
-                'code': code_from_remarks
+                'code': code_from_remarks,
+                'color_hint': color_hint,
+                'remark_name': remark_name
             })
-    
+
     return circuits
 
 
 def _group_emergency_by_code(
-    circuits: List[Dict[str, str]], 
+    circuits: List[Dict[str, str]],
     code_info_map: Dict[str, Dict[str, str]]
 ) -> List[Dict[str, object]]:
     """CODE별로 Circuit 그룹화 (GSP/MSBD 구분 표시)"""
     code_circuits = {}
+    color_hints: Dict[str, List[str]] = defaultdict(list)
+    name_hints: Dict[str, List[str]] = defaultdict(list)
     
     code_variations = {}
     for code in code_info_map.keys():
@@ -2035,15 +2134,23 @@ def _group_emergency_by_code(
         
         if matched_code not in code_circuits:
             code_circuits[matched_code] = {'gsp': [], 'msbd': []}
-        
+
         doc_type = circuit.get('doc_type', 'MSBD')
         target_list = code_circuits[matched_code]['gsp'] if doc_type == 'GSP' else code_circuits[matched_code]['msbd']
-        
+
         target_list.append({
             'circuit_no': circuit.get('circuit_no', ''),
             'circuit_name': circuit.get('circuit_name', ''),
-            'panel': circuit.get('panel', '')
+            'panel': circuit.get('panel', ''),
+            'remark_name': circuit.get('remark_name', '')
         })
+
+        hint_color = circuit.get('color_hint', '')
+        if hint_color:
+            color_hints[matched_code].append(hint_color)
+        hint_name = circuit.get('remark_name', '')
+        if hint_name:
+            name_hints[matched_code].append(hint_name)
     
     result = []
     
@@ -2051,14 +2158,33 @@ def _group_emergency_by_code(
         info = code_info_map.get(code, {})
         color = info.get("color", "")
         name = info.get("name", "")
-        
+
+        if not color:
+            votes = defaultdict(int)
+            for hint in color_hints.get(code, []):
+                votes[hint.upper()] += 1
+            if votes:
+                color = max(votes.items(), key=lambda kv: kv[1])[0]
+
         gsp_circuits = code_circuits.get(code, {}).get('gsp', [])
         msbd_circuits = code_circuits.get(code, {}).get('msbd', [])
-        
+
         if not name:
-            all_circuits = gsp_circuits + msbd_circuits
-            if all_circuits:
-                name = max([c['circuit_name'] for c in all_circuits], key=len)
+            hint_pool = name_hints.get(code, [])
+            if hint_pool:
+                name = max(hint_pool, key=len)
+            else:
+                all_circuits = gsp_circuits + msbd_circuits
+                name_candidates = [c['circuit_name'] for c in all_circuits if c.get('circuit_name')]
+                if name_candidates:
+                    name = max(name_candidates, key=len)
+
+        def _format_circuit_entry(c: Dict[str, str]) -> str:
+            label = c.get('circuit_no', '')
+            cname = c.get('circuit_name') or c.get('remark_name')
+            if cname:
+                return f"{label} – {cname}"
+            return label
         
         groups = []
         
@@ -2068,8 +2194,8 @@ def _group_emergency_by_code(
                 panel = circuit['panel']
                 if panel not in gsp_panel_groups:
                     gsp_panel_groups[panel] = []
-                gsp_panel_groups[panel].append(circuit['circuit_no'])
-            
+                gsp_panel_groups[panel].append(_format_circuit_entry(circuit))
+
             for panel, circs in sorted(gsp_panel_groups.items()):
                 groups.append({
                     'panel_header': f"[GSP] {panel}",
@@ -2082,8 +2208,8 @@ def _group_emergency_by_code(
                 panel = circuit['panel']
                 if panel not in msbd_panel_groups:
                     msbd_panel_groups[panel] = []
-                msbd_panel_groups[panel].append(circuit['circuit_no'])
-            
+                msbd_panel_groups[panel].append(_format_circuit_entry(circuit))
+
             for panel, circs in sorted(msbd_panel_groups.items()):
                 groups.append({
                     'panel_header': f"[MSBD] {panel}",
