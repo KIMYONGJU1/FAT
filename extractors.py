@@ -403,7 +403,8 @@ def _find_filled_checkboxes(page) -> List[Dict[str, float]]:
             cy = (rect["top"] + rect["bottom"]) / 2.0
             checkboxes.append({"x": cx, "y": cy})
     
-    print(f"  체크박스 좌표: {[(f'({c['x']:.1f}, {c['y']:.1f})') for c in checkboxes[:5]]}")
+    samples = [f"({c['x']:.1f}, {c['y']:.1f})" for c in checkboxes[:5]]
+    print(f"  체크박스 좌표: {samples}")
     return checkboxes
 
 def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[str, Tuple[float, float]]:
@@ -513,7 +514,14 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
                     if slot not in panel_positions:
                         panel_positions[slot] = cluster_x
                         print(f"  ✓ {slot} 추정 (cluster): X={cluster_x:.1f}")
-    
+
+    # 방법4: INCOMING 1&2 사이에 BUS-TIE가 있을 것으로 보정
+    if "bus" not in panel_positions:
+        if "no1" in panel_positions and "no2" in panel_positions:
+            mid_x = (panel_positions["no1"] + panel_positions["no2"]) / 2.0
+            panel_positions["bus"] = mid_x
+            print(f"  ✓ bus 보정 (midpoint): X={mid_x:.1f}")
+
     # X축 범위 계산
     if not panel_positions:
         print("[ERROR] PANEL 위치를 전혀 찾을 수 없습니다!")
@@ -1710,22 +1718,37 @@ def _extract_emergency_codes_from_nameplate(pdf) -> Dict[str, Dict[str, str]]:
 def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
     """텍스트에서 모든 CODE 패턴 추출"""
     code_map = {}
-    
+
+    color_phrases = [
+        "DARK GREEN",
+        "LIGHT GREEN",
+        "LIGHT BLUE",
+        "DARK BLUE",
+        "NAVY BLUE",
+        "DARK RED",
+        "LIGHT RED",
+        "GOLDEN",
+        "SILVER",
+        "PURPLE",
+        "ORANGE",
+        "YELLOW",
+        "GREEN",
+        "BLUE",
+        "BROWN",
+        "BLACK",
+        "WHITE",
+        "PINK",
+    ]
+
     emergency_patterns = [
         re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
-    color_keywords = [
-        'RED', 'PINK', 'BROWN', 'BLUE', 'GREEN', 'YELLOW',
-        'GOLDEN', 'SILVER', 'PURPLE', 'ORANGE', 'WHITE', 'BLACK',
-        'LIGHT', 'DARK', 'NAVY'
-    ]
-    
+
     lines = text.split('\n')
-    
+
     for i, line in enumerate(lines):
         line_upper = line.upper()
         
@@ -1740,19 +1763,18 @@ def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
         
         if not found_code:
             continue
-        
+
         color = ""
-        words = line_upper.split()
-        for word in words:
-            if word in color_keywords:
-                color = word
+        for phrase in color_phrases:
+            if phrase in line_upper:
+                color = phrase
                 break
-        
+
         name = ""
         code_pos = line_upper.find(found_code)
         if code_pos != -1:
             after_code = line[code_pos + len(found_code):].strip()
-            for kw in color_keywords:
+            for kw in color_phrases:
                 after_code = re.sub(r'\b' + kw + r'\b', '', after_code, flags=re.I)
             after_code = re.sub(r'\s+', ' ', after_code).strip()
             if len(after_code) > 10:
@@ -1777,7 +1799,28 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
+    color_phrases = [
+        "DARK GREEN",
+        "LIGHT GREEN",
+        "LIGHT BLUE",
+        "DARK BLUE",
+        "NAVY BLUE",
+        "DARK RED",
+        "LIGHT RED",
+        "GOLDEN",
+        "SILVER",
+        "PURPLE",
+        "ORANGE",
+        "YELLOW",
+        "GREEN",
+        "BLUE",
+        "BROWN",
+        "BLACK",
+        "WHITE",
+        "PINK",
+    ]
+
     for row in table:
         if not row:
             continue
@@ -1796,10 +1839,32 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
                     break
             if found_code:
                 break
-        
+
         if found_code:
-            code_map[found_code] = {"color": "", "name": ""}
-    
+            color = ""
+            name_candidates: List[str] = []
+            for cell in row:
+                cell_text = str(cell or "").strip()
+                cell_upper = cell_text.upper()
+                if not color:
+                    for phrase in color_phrases:
+                        if phrase in cell_upper:
+                            color = phrase
+                            break
+                if cell_text and found_code not in cell_upper:
+                    cleaned = cell_text
+                    for phrase in color_phrases:
+                        cleaned = re.sub(r'\b' + re.escape(phrase) + r'\b', '', cleaned, flags=re.I)
+                    cleaned = cleaned.strip(" :-·().")
+                    if len(cleaned) > 3:
+                        name_candidates.append(cleaned)
+
+            name = ""
+            if name_candidates:
+                name = max(name_candidates, key=len)
+
+            code_map[found_code] = {"color": color, "name": name}
+
     return code_map
 
 
