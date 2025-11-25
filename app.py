@@ -496,12 +496,21 @@ class App(tk.Tk):
         self.em_tree.heading("code", text="CODE")
         self.em_tree.heading("color", text="COLOR")
         self.em_tree.heading("name", text="NAME")
-        self.em_tree.column("code", width=90, anchor="w")
-        self.em_tree.column("color", width=100, anchor="w")
-        self.em_tree.column("name", width=220, anchor="w")
+        self.em_tree.column("code", width=110, anchor="w", stretch=False)
+        self.em_tree.column("color", width=120, anchor="w", stretch=False)
+        self.em_tree.column("name", width=360, anchor="w", stretch=True)
         em_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.em_tree.yview)
-        self.em_tree.configure(yscrollcommand=em_scroll.set)
+        em_hscroll = ttk.Scrollbar(list_frame, orient="horizontal", command=self.em_tree.xview)
+        self.em_tree.configure(yscrollcommand=em_scroll.set, xscrollcommand=em_hscroll.set)
+        # shift + 휠로 좌우 이동, 트리폭보다 긴 이름을 드래그로 확인
+        self.em_tree.bind("<Shift-MouseWheel>", lambda e: self.em_tree.xview_scroll(int(-1 * (e.delta/120)), "units"))
+        self.em_tree.bind("<ButtonPress-2>", lambda e: self.em_tree.scan_mark(e.x, e.y))
+        self.em_tree.bind("<B2-Motion>", lambda e: self.em_tree.scan_dragto(e.x, e.y, gain=1))
+        self.em_tree.bind("<ButtonPress-1>", self._em_tree_drag_start, add="+")
+        self.em_tree.bind("<B1-Motion>", self._em_tree_drag_move, add="+")
+        self.em_tree.bind("<Configure>", lambda e: self._em_resize_columns())
         em_scroll.grid(row=0, column=1, sticky="ns")
+        em_hscroll.grid(row=1, column=0, sticky="ew")
         self.em_tree.bind("<<TreeviewSelect>>", lambda e: self._em_select())
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
@@ -929,6 +938,7 @@ class App(tk.Tk):
             color = e.get("color", "")
             name = e.get("name", "")
             self.em_tree.insert("", "end", iid=str(idx), values=(code, color, name))
+        self._em_resize_columns()
         target = current if current in self.em_tree.get_children() else None
         if target is None and self.em_stops_data:
             target = "0"
@@ -942,6 +952,28 @@ class App(tk.Tk):
             self.em_name.set("")
             self._update_color_chip("")
             self.txt_em_circuits.delete("1.0", "end")
+
+    def _em_tree_drag_start(self, event):
+        if not hasattr(self, "em_tree"):
+            return
+        if event.state & 0x0001:  # Shift + drag
+            self.em_tree.scan_mark(event.x, event.y)
+            return "break"
+
+    def _em_tree_drag_move(self, event):
+        if not hasattr(self, "em_tree"):
+            return
+        if event.state & 0x0001:
+            self.em_tree.scan_dragto(event.x, event.y, gain=1)
+            return "break"
+
+    def _em_resize_columns(self):
+        try:
+            total = self.em_tree.winfo_width()
+            fixed = self.em_tree.column("code", "width") + self.em_tree.column("color", "width") + 28
+            self.em_tree.column("name", width=max(220, total - fixed))
+        except Exception:
+            pass
 
     def _em_select(self):
         if not hasattr(self, "em_tree"):
