@@ -206,7 +206,10 @@ class App(tk.Tk):
     def _update_color_chip(self, color_text: str):
         try:
             hex_color = self._color_to_hex(color_text)
-            self.em_color_chip.configure(bg=hex_color)
+            if hasattr(self, "em_color_chip"):
+                self.em_color_chip.configure(bg=hex_color)
+            if hasattr(self, "pt_color_chip"):
+                self.pt_color_chip.configure(bg=hex_color)
         except Exception:
             pass
 
@@ -292,6 +295,7 @@ class App(tk.Tk):
         self.panel_slot_vars: Dict[str, Dict[str, tk.StringVar]] = {}
         self.panels_data = []
         self.em_stops_data = []
+        self.pt_trips_data = []
         self.gsp_function_data = []
         self.gsp_function_slots = [
             ("No.1 GROUP STARTER PANEL", FUNCTION_TEST_KEYS[0]),
@@ -337,11 +341,13 @@ class App(tk.Tk):
         self.page_spec = ttk.Frame(self.values_nb)
         self.page_panel = ttk.Frame(self.values_nb)
         self.page_estop = ttk.Frame(self.values_nb)
+        self.page_ptrip = ttk.Frame(self.values_nb)
         self.page_gsp = ttk.Frame(self.values_nb)
         self.values_nb.add(self.page_spec, text="① 표지 / GENERAL SPEC")
         self.values_nb.add(self.page_panel, text="② PANEL INFORMATION")
         self.values_nb.add(self.page_gsp, text="③ FUNCTION TEST OF GSP")
         self.values_nb.add(self.page_estop, text="④ EMERGENCY STOP PANEL")
+        self.values_nb.add(self.page_ptrip, text="⑤ PREFERENTIAL TRIP LIST")
         self.values_nb.grid(row=0, column=0, sticky="nsew")
 
         self.entries: Dict[str, tk.Entry] = {}
@@ -496,12 +502,21 @@ class App(tk.Tk):
         self.em_tree.heading("code", text="CODE")
         self.em_tree.heading("color", text="COLOR")
         self.em_tree.heading("name", text="NAME")
-        self.em_tree.column("code", width=90, anchor="w")
-        self.em_tree.column("color", width=100, anchor="w")
-        self.em_tree.column("name", width=220, anchor="w")
+        self.em_tree.column("code", width=110, anchor="w", stretch=False)
+        self.em_tree.column("color", width=120, anchor="w", stretch=False)
+        self.em_tree.column("name", width=360, anchor="w", stretch=True)
         em_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.em_tree.yview)
-        self.em_tree.configure(yscrollcommand=em_scroll.set)
+        em_hscroll = ttk.Scrollbar(list_frame, orient="horizontal", command=self.em_tree.xview)
+        self.em_tree.configure(yscrollcommand=em_scroll.set, xscrollcommand=em_hscroll.set)
+        # shift + 휠로 좌우 이동, 트리폭보다 긴 이름을 드래그로 확인
+        self.em_tree.bind("<Shift-MouseWheel>", lambda e: self.em_tree.xview_scroll(int(-1 * (e.delta/120)), "units"))
+        self.em_tree.bind("<ButtonPress-2>", lambda e: self.em_tree.scan_mark(e.x, e.y))
+        self.em_tree.bind("<B2-Motion>", lambda e: self.em_tree.scan_dragto(e.x, e.y, gain=1))
+        self.em_tree.bind("<ButtonPress-1>", self._em_tree_drag_start, add="+")
+        self.em_tree.bind("<B1-Motion>", self._em_tree_drag_move, add="+")
+        self.em_tree.bind("<Configure>", lambda e: self._em_resize_columns())
         em_scroll.grid(row=0, column=1, sticky="ns")
+        em_hscroll.grid(row=1, column=0, sticky="ew")
         self.em_tree.bind("<<TreeviewSelect>>", lambda e: self._em_select())
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
@@ -537,6 +552,76 @@ class App(tk.Tk):
         em_hsb.grid(row=2, column=0, sticky="ew")
         self.txt_em_circuits.configure(yscrollcommand=em_vsb.set, xscrollcommand=em_hsb.set)
         ttk.Button(right_estop, text="적용(현 항목)", command=self._em_apply).pack(anchor="e", pady=(8, 0))
+
+        # Preferential Trip tab (⑤)
+        ptrip_wrap = ttk.Frame(self.page_ptrip, padding=12)
+        ptrip_wrap.pack(fill="both", expand=True)
+        ptrip_paned = ttk.PanedWindow(ptrip_wrap, orient="horizontal")
+        ptrip_paned.pack(fill="both", expand=True)
+
+        left_ptrip = ttk.Frame(ptrip_paned)
+        ptrip_paned.add(left_ptrip, weight=1)
+        right_ptrip = ttk.Frame(ptrip_paned)
+        ptrip_paned.add(right_ptrip, weight=2)
+
+        pt_list_frame = ttk.Frame(left_ptrip)
+        pt_list_frame.pack(fill="both", expand=True)
+        pt_columns = ("code", "color", "name")
+        self.pt_tree = ttk.Treeview(pt_list_frame, columns=pt_columns, show="headings", selectmode="browse")
+        self.pt_tree.grid(row=0, column=0, sticky="nsew")
+        self.pt_tree.heading("code", text="CODE")
+        self.pt_tree.heading("color", text="COLOR")
+        self.pt_tree.heading("name", text="NAME")
+        self.pt_tree.column("code", width=110, anchor="w", stretch=False)
+        self.pt_tree.column("color", width=120, anchor="w", stretch=False)
+        self.pt_tree.column("name", width=360, anchor="w", stretch=True)
+        pt_scroll = ttk.Scrollbar(pt_list_frame, orient="vertical", command=self.pt_tree.yview)
+        pt_hscroll = ttk.Scrollbar(pt_list_frame, orient="horizontal", command=self.pt_tree.xview)
+        self.pt_tree.configure(yscrollcommand=pt_scroll.set, xscrollcommand=pt_hscroll.set)
+        self.pt_tree.bind("<Shift-MouseWheel>", lambda e: self.pt_tree.xview_scroll(int(-1 * (e.delta/120)), "units"))
+        self.pt_tree.bind("<ButtonPress-2>", lambda e: self.pt_tree.scan_mark(e.x, e.y))
+        self.pt_tree.bind("<B2-Motion>", lambda e: self.pt_tree.scan_dragto(e.x, e.y, gain=1))
+        self.pt_tree.bind("<ButtonPress-1>", self._pt_tree_drag_start, add="+")
+        self.pt_tree.bind("<B1-Motion>", self._pt_tree_drag_move, add="+")
+        self.pt_tree.bind("<Configure>", lambda e: self._pt_resize_columns())
+        pt_scroll.grid(row=0, column=1, sticky="ns")
+        pt_hscroll.grid(row=1, column=0, sticky="ew")
+        self.pt_tree.bind("<<TreeviewSelect>>", lambda e: self._pt_select())
+        pt_list_frame.columnconfigure(0, weight=1)
+        pt_list_frame.rowconfigure(0, weight=1)
+        ttk.Button(left_ptrip, text="새로고침", command=self._pt_refresh_list).pack(fill="x", pady=(6, 0))
+
+        info_ptrip = ttk.LabelFrame(right_ptrip, text="PREFERENTIAL TRIP 기본 정보", padding=12)
+        info_ptrip.pack(fill="x")
+        self.pt_code = tk.StringVar()
+        self.pt_name = tk.StringVar()
+        self.pt_color = tk.StringVar()
+        ttk.Label(info_ptrip, text="CODE").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Entry(info_ptrip, textvariable=self.pt_code, width=20).grid(row=0, column=1, sticky="ew", pady=2)
+        ttk.Label(info_ptrip, text="COLOR").grid(row=1, column=0, sticky="w", pady=2)
+        pt_color_holder = ttk.Frame(info_ptrip)
+        pt_color_holder.grid(row=1, column=1, sticky="ew", pady=2)
+        pt_color_holder.columnconfigure(0, weight=1)
+        ttk.Entry(pt_color_holder, textvariable=self.pt_color).grid(row=0, column=0, sticky="ew")
+        self.pt_color_chip = tk.Label(pt_color_holder, width=10, relief="groove", borderwidth=1)
+        self.pt_color_chip.grid(row=0, column=1, padx=(6,0))
+        ttk.Label(info_ptrip, text="NAME").grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(info_ptrip, textvariable=self.pt_name, width=40).grid(row=2, column=1, sticky="ew", pady=2)
+        info_ptrip.columnconfigure(1, weight=1)
+
+        pt_groups_frame = ttk.LabelFrame(right_ptrip, text="회로 그룹 (CODE별 패널)", padding=12)
+        pt_groups_frame.pack(fill="both", expand=True, pady=(10, 0))
+        pt_groups_frame.columnconfigure(0, weight=1)
+        pt_groups_frame.rowconfigure(0, weight=1)
+        ttk.Label(pt_groups_frame, text="예: PT-1 [No.1 AC440V FEEDER PANEL]\nP31-001-01-PN, P31-002-01-PN", justify="left").grid(row=0, column=0, sticky="w", pady=(0,6))
+        self.txt_pt_circuits = tk.Text(pt_groups_frame, wrap="word")
+        self.txt_pt_circuits.grid(row=1, column=0, sticky="nsew")
+        pt_vsb = ttk.Scrollbar(pt_groups_frame, orient="vertical", command=self.txt_pt_circuits.yview)
+        pt_vsb.grid(row=1, column=1, sticky="ns")
+        pt_hsb = ttk.Scrollbar(pt_groups_frame, orient="horizontal", command=self.txt_pt_circuits.xview)
+        pt_hsb.grid(row=2, column=0, sticky="ew")
+        self.txt_pt_circuits.configure(yscrollcommand=pt_vsb.set, xscrollcommand=pt_hsb.set)
+        ttk.Button(right_ptrip, text="적용(현 항목)", command=self._pt_apply).pack(anchor="e", pady=(8, 0))
 
         log_frame = ttk.LabelFrame(container, text="로그", style="Card.TLabelframe")
         log_frame.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
@@ -699,13 +784,15 @@ class App(tk.Tk):
                 if not ems:
                     ems = ex.parse_emergency_colorplate(msbd)
                 
-                self.em_stops_data = ems or []
-                
+                ems = ems or []
+                self._split_em_and_pt(ems)
+
             except Exception as e:
                 self.log(f"[WARN] Emergency 파싱 실패: {e}")
                 import traceback
                 traceback.print_exc()
                 self.em_stops_data = []
+                self.pt_trips_data = []
 
             # Fill GENERAL SPEC entries
             for k, e in self.entries.items():
@@ -718,6 +805,7 @@ class App(tk.Tk):
                 self._panel_fill_ui()
                 self._gsp_refresh_ui()
                 self._em_refresh_list()
+                self._pt_refresh_list()
             except Exception:
                 pass
 
@@ -915,6 +1003,18 @@ class App(tk.Tk):
                 else:
                     tree.insert("", "end", values=("", "추출된 데이터 없음"))
 
+    def _split_em_and_pt(self, items: List[Dict[str, object]]):
+        self.em_stops_data = []
+        self.pt_trips_data = []
+        for item in items or []:
+            code = (item.get("code") or "").upper()
+            name = (item.get("name") or "").upper()
+            is_pt = code.startswith("PT") or "PREFERENTIAL TRIP" in name
+            if is_pt:
+                self.pt_trips_data.append(dict(item))
+            else:
+                self.em_stops_data.append(dict(item))
+
     def _em_refresh_list(self):
         if not hasattr(self, "em_tree"):
             return
@@ -929,6 +1029,7 @@ class App(tk.Tk):
             color = e.get("color", "")
             name = e.get("name", "")
             self.em_tree.insert("", "end", iid=str(idx), values=(code, color, name))
+        self._em_resize_columns()
         target = current if current in self.em_tree.get_children() else None
         if target is None and self.em_stops_data:
             target = "0"
@@ -942,6 +1043,28 @@ class App(tk.Tk):
             self.em_name.set("")
             self._update_color_chip("")
             self.txt_em_circuits.delete("1.0", "end")
+
+    def _em_tree_drag_start(self, event):
+        if not hasattr(self, "em_tree"):
+            return
+        if event.state & 0x0001:  # Shift + drag
+            self.em_tree.scan_mark(event.x, event.y)
+            return "break"
+
+    def _em_tree_drag_move(self, event):
+        if not hasattr(self, "em_tree"):
+            return
+        if event.state & 0x0001:
+            self.em_tree.scan_dragto(event.x, event.y, gain=1)
+            return "break"
+
+    def _em_resize_columns(self):
+        try:
+            total = self.em_tree.winfo_width()
+            fixed = self.em_tree.column("code", "width") + self.em_tree.column("color", "width") + 28
+            self.em_tree.column("name", width=max(220, total - fixed))
+        except Exception:
+            pass
 
     def _em_select(self):
         if not hasattr(self, "em_tree"):
@@ -1028,6 +1151,144 @@ class App(tk.Tk):
             self.em_tree.selection_set(item_id)
             self.em_tree.focus(item_id)
         self.log(f"[OK] Emergency 항목 업데이트: {e.get('code')}")
+
+    # ---------- Preferential Trip helpers ----------
+    def _pt_refresh_list(self):
+        if not hasattr(self, "pt_tree"):
+            return
+        current = None
+        sel = self.pt_tree.selection()
+        if sel:
+            current = sel[0]
+        for item in self.pt_tree.get_children():
+            self.pt_tree.delete(item)
+        for idx, e in enumerate(self.pt_trips_data):
+            code = e.get("code", "")
+            color = e.get("color", "")
+            name = e.get("name", "")
+            self.pt_tree.insert("", "end", iid=str(idx), values=(code, color, name))
+        self._pt_resize_columns()
+        target = current if current in self.pt_tree.get_children() else None
+        if target is None and self.pt_trips_data:
+            target = "0"
+        if target is not None:
+            self.pt_tree.selection_set(target)
+            self.pt_tree.focus(target)
+            self._pt_select()
+        elif hasattr(self, "txt_pt_circuits"):
+            self.pt_code.set("")
+            self.pt_color.set("")
+            self.pt_name.set("")
+            self._update_color_chip("")
+            self.txt_pt_circuits.delete("1.0", "end")
+
+    def _pt_tree_drag_start(self, event):
+        if not hasattr(self, "pt_tree"):
+            return
+        if event.state & 0x0001:
+            self.pt_tree.scan_mark(event.x, event.y)
+            return "break"
+
+    def _pt_tree_drag_move(self, event):
+        if not hasattr(self, "pt_tree"):
+            return
+        if event.state & 0x0001:
+            self.pt_tree.scan_dragto(event.x, event.y, gain=1)
+            return "break"
+
+    def _pt_resize_columns(self):
+        try:
+            total = self.pt_tree.winfo_width()
+            fixed = self.pt_tree.column("code", "width") + self.pt_tree.column("color", "width") + 28
+            self.pt_tree.column("name", width=max(220, total - fixed))
+        except Exception:
+            pass
+
+    def _pt_select(self):
+        if not hasattr(self, "pt_tree"):
+            return
+        sel = self.pt_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.pt_trips_data)):
+            return
+        e = self.pt_trips_data[idx]
+        self.pt_code.set(e.get("code",""))
+        self.pt_color.set(e.get("color",""))
+        self.pt_name.set(e.get("name",""))
+        self._update_color_chip(e.get("color",""))
+        blocks = []
+        code = e.get("code", "")
+        for g in e.get("groups", []):
+            header = g.get("panel_header","")
+            circs = ", ".join(g.get("circuits", []))
+            prefix = f"{code} " if code else ""
+            body = circs if circs else ""
+            blocks.append(f"{prefix}[{header}]\n{body}".strip())
+        self.txt_pt_circuits.delete("1.0","end")
+        self.txt_pt_circuits.insert("1.0","\n\n".join(blocks))
+
+    def _pt_apply(self):
+        if not hasattr(self, "pt_tree"):
+            return
+        sel = self.pt_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        if not (0 <= idx < len(self.pt_trips_data)):
+            return
+        e = self.pt_trips_data[idx]
+        e["code"] = self.pt_code.get().strip()
+        e["color"] = self.pt_color.get().strip()
+        e["name"] = self.pt_name.get().strip()
+        raw_blocks = self.txt_pt_circuits.get("1.0","end").strip()
+        blocks = [b.strip() for b in raw_blocks.split("\n\n") if b.strip()]
+        groups = []
+        for b in blocks:
+            lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+            if not lines:
+                continue
+            first = lines[0]
+            header = first
+            if '[' in first and ']' in first:
+                header = first[first.find('[')+1:first.rfind(']')]
+            header = header.replace('*','').strip()
+            rest_text = "\n".join(lines[1:])
+            circs: List[str] = []
+            tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', rest_text.upper())
+            if not tokens:
+                tokens = re.findall(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', first.upper())
+            if tokens:
+                seen: List[str] = []
+                for t in tokens:
+                    if t not in seen:
+                        seen.append(t)
+                circs = seen
+            else:
+                raw = rest_text if rest_text else "".join(lines[1:])
+                if not raw:
+                    raw = " ".join(lines[1:])
+                for ln in lines[1:]:
+                    for part in re.split(r'[,、;]+', ln):
+                        val = part.strip()
+                        if val:
+                            circs.append(val)
+            groups.append({"panel_header": header, "circuits": circs})
+        e["groups"] = groups
+        self.pt_trips_data[idx] = e
+        self._pt_refresh_list()
+        item_id = str(idx)
+        if item_id in self.pt_tree.get_children():
+            self.pt_tree.selection_set(item_id)
+            self.pt_tree.focus(item_id)
+        self.log(f"[OK] PREFERENTIAL 항목 업데이트: {e.get('code')}")
 
 if __name__ == "__main__":
     app = App()
