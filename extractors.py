@@ -153,6 +153,7 @@ MUNSELL_RE = re.compile(r'\b\d{1,2}\s*(?:N|R|YR|Y|GY|G|BG|B|PB|P|RP)\s*\d(?:\.\d
 def clean_num(s: str) -> str:
     return re.sub(r'\s+', ' ', s.strip())
 
+
 PANEL_SLOT_SPECS = [
     {
         "slot": "no1",
@@ -1963,25 +1964,25 @@ def _extract_emergency_codes_from_nameplate(pdf) -> Dict[str, Dict[str, str]]:
 def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
     """텍스트에서 모든 CODE 패턴 추출"""
     code_map = {}
-    
+
     emergency_patterns = [
         re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
     color_keywords = [
         'RED', 'PINK', 'BROWN', 'BLUE', 'GREEN', 'YELLOW',
         'GOLDEN', 'SILVER', 'PURPLE', 'ORANGE', 'WHITE', 'BLACK',
         'LIGHT', 'DARK', 'NAVY'
     ]
-    
+
     lines = text.split('\n')
-    
+
     for i, line in enumerate(lines):
         line_upper = line.upper()
-        
+
         found_code = None
         for pattern in emergency_patterns:
             match = pattern.search(line_upper)
@@ -1990,17 +1991,17 @@ def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
                 if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
                     found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
                 break
-        
+
         if not found_code:
             continue
-        
+
         color = ""
         words = line_upper.split()
         for word in words:
             if word in color_keywords:
                 color = word
                 break
-        
+
         name = ""
         code_pos = line_upper.find(found_code)
         if code_pos != -1:
@@ -2008,38 +2009,66 @@ def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
             for kw in color_keywords:
                 after_code = re.sub(r'\b' + kw + r'\b', '', after_code, flags=re.I)
             after_code = re.sub(r'\s+', ' ', after_code).strip()
-            if len(after_code) > 10:
+            # 이름 길이가 짧아도 남겨서 후속 매핑에 활용
+            if len(after_code) > 2:
                 name = after_code
-        
+
+        if not name and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            next_upper = next_line.upper()
+            if next_line and not any(p.search(next_upper) for p in emergency_patterns):
+                cleaned_next = re.sub(r'\s+', ' ', next_line).strip()
+                cleaned_next = re.sub(r'\b(' + '|'.join(color_keywords) + r')\b', '', cleaned_next, flags=re.I)
+                cleaned_next = re.sub(r'\s+', ' ', cleaned_next).strip()
+                if len(cleaned_next) > 2:
+                    name = cleaned_next
+
         if found_code:
             code_map[found_code] = {"color": color, "name": name}
-    
+
     return code_map
 
 
 def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict[str, str]]:
     """테이블에서 CODE, COLOR, NAME 추출"""
-    code_map = {}
-    
+    code_map: Dict[str, Dict[str, str]] = {}
+
     if not table or len(table) < 1:
         return code_map
-    
+
     emergency_patterns = [
         re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
+    # 헤더 위치 파악 (이름/코드/색상 컬럼이 명시된 경우에만 사용)
+    color_col = name_col = code_col = None
+    for idx, row in enumerate(table[:5]):
+        if not row:
+            continue
+        upper_cells = [str(c or "").upper() for c in row]
+        if any("COLOR" in c or "COLOUR" in c for c in upper_cells) and "CODE" in " ".join(upper_cells):
+            for c_idx, raw in enumerate(upper_cells):
+                if color_col is None and ("COLOR" in raw or "COLOUR" in raw):
+                    color_col = c_idx
+                if name_col is None and "NAME" in raw:
+                    name_col = c_idx
+                if code_col is None and "CODE" in raw:
+                    code_col = c_idx
+            break
+
+    pending_code: Optional[str] = None
+
     for row in table:
         if not row:
             continue
-        
+
         found_code = None
-        for cell in row:
-            if not cell:
-                continue
-            cell_text = str(cell).strip().upper()
+        for col_idx, cell in enumerate(row):
+            cell_text_raw = str(cell or "").strip()
+            cell_text = cell_text_raw.upper()
             for pattern in emergency_patterns:
                 match = pattern.search(cell_text)
                 if match:
@@ -2049,10 +2078,43 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
                     break
             if found_code:
                 break
-        
+
         if found_code:
-            code_map[found_code] = {"color": "", "name": ""}
-    
+            color_val = ""
+            name_parts: List[str] = []
+
+            if color_col is not None and color_col < len(row):
+                color_val = str(row[color_col] or "").strip().upper()
+
+            if name_col is not None and name_col < len(row):
+                raw_name = str(row[name_col] or "").strip()
+                if raw_name:
+                    name_parts.append(raw_name)
+
+                for extra_idx in range(name_col + 1, len(row)):
+                    if extra_idx == code_col:
+                        continue
+                    extra = str(row[extra_idx] or "").strip()
+                    if extra:
+                        name_parts.append(extra)
+
+            name_val = re.sub(r'\s+', ' ', " ".join(name_parts)).strip()
+            name_val = name_val.replace(found_code, '').strip()
+
+            code_map[found_code] = {"color": color_val, "name": name_val}
+            pending_code = found_code
+        else:
+            if pending_code and pending_code in code_map and name_col is not None:
+                continuation = str(row[name_col] or "").strip() if name_col < len(row) else ""
+                if continuation:
+                    extra = re.sub(r'\s+', ' ', continuation).strip()
+                    extra = extra.replace(pending_code, '').strip()
+                    if extra:
+                        if code_map[pending_code]["name"]:
+                            code_map[pending_code]["name"] += " " + extra
+                        else:
+                            code_map[pending_code]["name"] = extra
+
     return code_map
 
 
@@ -2143,6 +2205,7 @@ def _parse_emergency_circuit_table(
     cir_no_col = None
     cir_name_col = None
     remarks_col = None
+    emcy_col = None
     
     for idx, row in enumerate(table[:20]):
         if not row:
@@ -2161,6 +2224,14 @@ def _parse_emergency_circuit_table(
                 if 'REMARK' in cell_upper and remarks_col is None:
                     remarks_col = col_idx
                     break
+
+            for col_idx, cell in enumerate(row):
+                if not cell:
+                    continue
+                cell_upper = str(cell).upper().strip()
+
+                if re.search(r"EM'?CY|EMERGENCY", cell_upper) and 'STOP' in cell_upper:
+                    emcy_col = col_idx
             
             for col_idx, cell in enumerate(row):
                 if not cell:
@@ -2216,7 +2287,18 @@ def _parse_emergency_circuit_table(
             continue
         
         code_from_remarks = ""
-        if remarks_col is not None and remarks_col < len(row):
+
+        if doc_type == "GSP" and emcy_col is not None and emcy_col < len(row):
+            emcy_text = str(row[emcy_col] or '').strip().upper()
+            for pattern in emergency_code_patterns:
+                match = pattern.search(emcy_text)
+                if match:
+                    code_from_remarks = match.group(1).upper()
+                    if '-' not in code_from_remarks and re.match(r'[A-Z]{2,4}\d+', code_from_remarks):
+                        code_from_remarks = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code_from_remarks)
+                    break
+
+        if not code_from_remarks and remarks_col is not None and remarks_col < len(row):
             remarks_text = str(row[remarks_col] or '').strip().upper()
             for pattern in emergency_code_patterns:
                 match = pattern.search(remarks_text)
