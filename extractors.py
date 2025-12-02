@@ -2521,9 +2521,25 @@ def _parse_emergency_circuit_table(
                 remarks_col = col_idx
                 break
     
+    def _normalize_circuit_no(raw: str) -> Optional[str]:
+        """공백/특수문자를 제거한 뒤 P-XX-XXX-XX(-SUFFIX) 형태로 정규화"""
+        token = (raw or "").upper().replace('–', '-').replace('—', '-').strip()
+        token = re.sub(r'\s+', '', token)
+
+        m = re.match(r'^P\s*(\d{1,2})-?(\d{2,3})-?(\d{2,3})-?([A-Z0-9]{0,3})', token, flags=re.I)
+        if not m:
+            return None
+
+        g1, g2, g3, g4 = m.groups()
+        parts = [f"P{g1}", g2, g3]
+        if g4:
+            parts.append(g4)
+        return "-".join(parts)
+
     circuit_patterns = [
-        re.compile(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', re.I),
-        re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I),
+        # 공백이 섞여 있어도 P-XX-XXX-XX(-A/B 등) 형태를 모두 회수
+        re.compile(r'P\s*\d{1,2}\s*-\s*\d{2,3}\s*-\s*\d{2,3}\s*-\s*[A-Z0-9]{1,3}', re.I),
+        re.compile(r'P\s*\d{1,2}\s*-\s*\d{2,3}\s*-\s*\d{2,3}', re.I),
     ]
     
     emergency_code_patterns = [
@@ -2536,24 +2552,43 @@ def _parse_emergency_circuit_table(
         re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
     ]
     
+    last_circuit_no = ""
+    last_circuit_name = ""
+
     for row_idx in range(header_idx + 1, len(table)):
         row = table[row_idx]
         if not row:
             continue
-        
+
         cir_no_cell = str(row[cir_no_col] or '').strip() if cir_no_col < len(row) else ""
-        circuit_match = None
         circuit_no = ""
-        
+
         for pattern in circuit_patterns:
-            circuit_match = pattern.search(cir_no_cell)
-            if circuit_match:
-                circuit_no = circuit_match.group(0).upper()
+            m = pattern.search(cir_no_cell)
+            if m:
+                circuit_no = _normalize_circuit_no(m.group(0)) or ""
                 break
-        
+
         if not circuit_no:
-            continue
-        
+            # 회로 번호 칸에 패턴이 없을 경우에도 전체 셀에서 P로 시작하는 토큰을 회수
+            for token in re.split(r'[\s,;/]+', cir_no_cell):
+                circuit_no = _normalize_circuit_no(token) or ""
+                if circuit_no:
+                    break
+
+        if not circuit_no:
+            # GSP 도면처럼 동일 회로에 여러 CODE가 매핑될 때, 회로 번호가 다른 칸에만 적힌 경우를 대비
+            for c_idx, cell in enumerate(row):
+                if c_idx == cir_no_col:
+                    continue
+                for pattern in circuit_patterns:
+                    m = pattern.search(str(cell or ''))
+                    if m:
+                        circuit_no = _normalize_circuit_no(m.group(0)) or ""
+                        break
+                if circuit_no:
+                    break
+
         codes_from_remarks: List[str] = []
 
         if doc_type == "GSP" and emcy_col is not None and emcy_col < len(row):
@@ -2578,7 +2613,11 @@ def _parse_emergency_circuit_table(
                     if code not in codes_from_remarks:
                         codes_from_remarks.append(code)
 
-        if not codes_from_remarks:
+        if not circuit_no and codes_from_remarks and last_circuit_no:
+            # 회로 번호가 비어있지만 코드가 발견되면 바로 윗줄의 회로를 연계
+            circuit_no = last_circuit_no
+
+        if not circuit_no:
             continue
         
         circuit_name = ""
@@ -2593,7 +2632,12 @@ def _parse_emergency_circuit_table(
             next_row = table[row_idx + 1]
             if cir_name_col < len(next_row):
                 next_name = str(next_row[cir_name_col] or '').strip()
-                has_next_circuit = any(pattern.search(str(next_row[cir_no_col] or '')) for pattern in circuit_patterns) if cir_no_col < len(next_row) else False
+                has_next_circuit = False
+                if cir_no_col < len(next_row):
+                    has_next_circuit = any(
+                        pattern.search(str(next_row[cir_no_col] or ''))
+                        for pattern in circuit_patterns
+                    )
                 if not has_next_circuit and len(next_name) > 1:
                     circuit_name = next_name
 
@@ -2612,6 +2656,18 @@ def _parse_emergency_circuit_table(
 
             if fallback_cells:
                 circuit_name = re.sub(r'\s+', ' ', ' '.join(fallback_cells)).strip()
+
+        if circuit_no:
+            last_circuit_no = circuit_no
+            if circuit_name:
+                last_circuit_name = circuit_name
+
+        if not codes_from_remarks and last_circuit_name and circuit_no == last_circuit_no:
+            # 회로 설명이 이어지는 행을 회로명 확장에 활용
+            if circuit_name:
+                circuit_name = f"{last_circuit_name} {circuit_name}".strip()
+            else:
+                circuit_name = last_circuit_name
 
         for code_from_remarks in codes_from_remarks:
             circuits.append({
