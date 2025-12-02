@@ -153,6 +153,90 @@ MUNSELL_RE = re.compile(r'\b\d{1,2}\s*(?:N|R|YR|Y|GY|G|BG|B|PB|P|RP)\s*\d(?:\.\d
 def clean_num(s: str) -> str:
     return re.sub(r'\s+', ' ', s.strip())
 
+
+def _normalize_code(raw: str) -> Optional[str]:
+    token = (raw or "").strip().upper()
+    if not token:
+        return None
+    token = token.replace('–', '-').replace('—', '-').replace('_', '-')
+    token = re.sub(r'^[^A-Z0-9-]+', '', token)
+    token = re.sub(r'[^A-Z0-9-]+$', '', token)
+    token = re.sub(r'[\*\(\)\[\]{}:]+', '', token)
+    token = re.sub(r'\s+', '', token)
+    if '-' not in token and re.match(r'[A-Z]{2,4}\d+', token):
+        token = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', token)
+    if not re.search(r'\d', token):
+        return None
+    return token
+
+
+def _extract_codes_from_text(text: str, patterns: List[re.Pattern]) -> List[str]:
+    found: List[str] = []
+    seen = set()
+    txt = (text or "").upper()
+    txt = re.sub(r'[\*\(\)\[\]{}:]+', ' ', txt)
+
+    def _add_code(raw_code: str):
+        norm = _normalize_code(raw_code)
+        if norm and norm not in seen:
+            seen.add(norm)
+            found.append(norm)
+        return norm
+
+    # pre-expand patterns like "FOAM 1A 1B 2A" or "CO2 -4 -5" where the prefix appears once
+    combo_pat = re.compile(r'\b([A-Z]{2,8})\s*-?\s*((?:\d+[A-Z]?)(?:[,/\s]+\d+[A-Z]?)+)')
+    for m in combo_pat.finditer(txt):
+        prefix = m.group(1)
+        suffix_block = m.group(2)
+        for suf in re.split(r'[,/\s]+', suffix_block):
+            suf = suf.strip()
+            if not suf:
+                continue
+            _add_code(f"{prefix}-{suf}")
+
+    # direct regex matches
+    last_prefix = None
+    for pat in patterns:
+        for m in pat.finditer(txt):
+            norm = _add_code(m.group(1))
+            if norm:
+                m_pref = re.match(r'^([A-Z]+)', norm)
+                if m_pref:
+                    last_prefix = m_pref.group(1)
+
+    # token-based fallback with chained suffix support (e.g., "FOAM-1A,1B/2A")
+    for token in re.split(r'[\s,;]+', txt):
+        if not token:
+            continue
+        for sub in re.split(r'[/]+', token):
+            if not sub:
+                continue
+            sub = re.sub(r'^[^A-Z0-9-]+', '', sub)
+            sub = re.sub(r'[^A-Z0-9-]+$', '', sub)
+            if not sub:
+                continue
+
+            norm = _normalize_code(sub)
+            if norm:
+                prefix_match = re.match(r'^([A-Z]+)', norm)
+                if prefix_match:
+                    last_prefix = prefix_match.group(1)
+                _add_code(norm)
+                continue
+
+            # store prefixes like "FOAM" or "CO2" even when digits are absent, so "-1A" attaches
+            prefix_candidate = re.sub(r'[^A-Z0-9]', '', sub)
+            if prefix_candidate and re.fullmatch(r'[A-Z]+\d*', prefix_candidate):
+                last_prefix = prefix_candidate
+                continue
+
+            if last_prefix and re.fullmatch(r'-?\d+[A-Z]?', sub):
+                candidate = f"{last_prefix}-{sub.lstrip('-')}"
+                _add_code(candidate)
+
+    return found
+
+
 PANEL_SLOT_SPECS = [
     {
         "slot": "no1",
@@ -1963,25 +2047,57 @@ def _extract_emergency_codes_from_nameplate(pdf) -> Dict[str, Dict[str, str]]:
 def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
     """텍스트에서 모든 CODE 패턴 추출"""
     code_map = {}
-    
+
     emergency_patterns = [
         re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
+
     color_keywords = [
         'RED', 'PINK', 'BROWN', 'BLUE', 'GREEN', 'YELLOW',
         'GOLDEN', 'SILVER', 'PURPLE', 'ORANGE', 'WHITE', 'BLACK',
         'LIGHT', 'DARK', 'NAVY'
     ]
-    
+
     lines = text.split('\n')
-    
+
+    def _clean_em_name(text: str) -> str:
+        cleaned = re.sub(r'\b(ES|CO2|PT|FOAM)-?\d+[A-Z]?\b', ' ', text, flags=re.I)
+        cleaned = re.sub(r'\b(' + '|'.join(color_keywords) + r')\b', ' ', cleaned, flags=re.I)
+        cleaned = re.sub(r'[\[\]{}<>]+', ' ', cleaned)
+        cleaned = cleaned.replace('·', ' ')
+        cleaned = re.sub(r'[,:;]+', ' ', cleaned)
+        tokens = []
+        prev = ""
+        for tok in re.split(r'\s+', cleaned):
+            tok = tok.strip()
+            if not tok:
+                continue
+            letters = re.sub(r'[^A-Za-z]', '', tok)
+            digits = re.sub(r'[^0-9]', '', tok)
+            upper_prev = (prev or '').upper()
+            # drop digit-only noise unless it is tied to NO./BUS context
+            if digits and not letters:
+                if upper_prev.startswith('NO') or upper_prev.endswith('BUS'):
+                    tokens.append(tok)
+                    prev = tok
+                    continue
+                # 짧은 숫자(예: 10, 90)도 불필요하게 앞에 붙어 나오는 경우가 많으므로 제외
+                prev = tok
+                continue
+            tokens.append(tok)
+            prev = tok
+        text_joined = re.sub(r'\s+', ' ', ' '.join(tokens)).strip(' -,:;')
+        text_joined = re.sub(r'^\d+\s+', '', text_joined)
+        # collapse duplicated one-letter fragments (예: "H H")
+        text_joined = re.sub(r'\b([A-Z])\s+\1\b', r'\1', text_joined, flags=re.I)
+        return text_joined
+
     for i, line in enumerate(lines):
         line_upper = line.upper()
-        
+
         found_code = None
         for pattern in emergency_patterns:
             match = pattern.search(line_upper)
@@ -1990,56 +2106,135 @@ def _parse_colorplate_comprehensive(text: str) -> Dict[str, Dict[str, str]]:
                 if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
                     found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
                 break
-        
+
         if not found_code:
             continue
-        
+
         color = ""
         words = line_upper.split()
         for word in words:
             if word in color_keywords:
                 color = word
                 break
-        
-        name = ""
+
+        name_parts: List[str] = []
         code_pos = line_upper.find(found_code)
         if code_pos != -1:
+            before_code = line[:code_pos].strip()
             after_code = line[code_pos + len(found_code):].strip()
+
             for kw in color_keywords:
+                before_code = re.sub(r'\b' + kw + r'\b', '', before_code, flags=re.I)
                 after_code = re.sub(r'\b' + kw + r'\b', '', after_code, flags=re.I)
+
+            before_code = re.sub(r'[\[\]{}<>:;]+', ' ', before_code)
+            after_code = re.sub(r'[\[\]{}<>:;]+', ' ', after_code)
+            before_code = re.sub(r'\s+', ' ', before_code).strip()
             after_code = re.sub(r'\s+', ' ', after_code).strip()
-            if len(after_code) > 10:
-                name = after_code
-        
+
+            if len(before_code) > 1:
+                name_parts.append(before_code)
+            if len(after_code) > 1:
+                name_parts.append(after_code)
+
+        look_ahead_limit = 3
+        for offset in range(1, look_ahead_limit + 1):
+            if i + offset >= len(lines):
+                break
+            next_line = lines[i + offset].strip()
+            next_upper = next_line.upper()
+            if not next_line:
+                continue
+            if any(p.search(next_upper) for p in emergency_patterns):
+                break
+            cleaned_next = re.sub(r'\b(' + '|'.join(color_keywords) + r')\b', '', next_line, flags=re.I)
+            cleaned_next = re.sub(r'\s+', ' ', cleaned_next).strip()
+            if len(cleaned_next) > 1:
+                name_parts.append(cleaned_next)
+
+        name = _clean_em_name(' '.join(name_parts))
+
         if found_code:
             code_map[found_code] = {"color": color, "name": name}
-    
+
     return code_map
 
 
 def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict[str, str]]:
     """테이블에서 CODE, COLOR, NAME 추출"""
-    code_map = {}
-    
+    code_map: Dict[str, Dict[str, str]] = {}
+
     if not table or len(table) < 1:
         return code_map
-    
+
     emergency_patterns = [
         re.compile(r'\b(ES-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-?\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-?\d+)\b', re.I),
         re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),
     ]
-    
-    for row in table:
+
+    color_keywords = {
+        'RED', 'PINK', 'BROWN', 'BLUE', 'GREEN', 'YELLOW',
+        'GOLDEN', 'SILVER', 'PURPLE', 'ORANGE', 'WHITE', 'BLACK',
+        'LIGHT', 'DARK', 'NAVY', 'LT', 'DK'
+    }
+
+    def _clean_em_name(text: str) -> str:
+        cleaned = re.sub(r'\b(ES|CO2|PT|FOAM)-?\d+[A-Z]?\b', ' ', text, flags=re.I)
+        cleaned = re.sub(r'\b(' + '|'.join(color_keywords) + r')\b', ' ', cleaned, flags=re.I)
+        cleaned = re.sub(r'[\[\]{}<>]+', ' ', cleaned)
+        cleaned = cleaned.replace('·', ' ')
+        cleaned = re.sub(r'[,:;]+', ' ', cleaned)
+        tokens = []
+        prev = ""
+        for tok in re.split(r'\s+', cleaned):
+            tok = tok.strip()
+            if not tok:
+                continue
+            letters = re.sub(r'[^A-Za-z]', '', tok)
+            digits = re.sub(r'[^0-9]', '', tok)
+            upper_prev = (prev or '').upper()
+            if digits and not letters:
+                if upper_prev.startswith('NO') or upper_prev.endswith('BUS'):
+                    tokens.append(tok)
+                    prev = tok
+                    continue
+                prev = tok
+                continue
+            tokens.append(tok)
+            prev = tok
+        text_joined = re.sub(r'\s+', ' ', ' '.join(tokens)).strip(' -,:;')
+        text_joined = re.sub(r'^\d+\s+', '', text_joined)
+        text_joined = re.sub(r'\b([A-Z])\s+\1\b', r'\1', text_joined, flags=re.I)
+        return text_joined
+
+    # 헤더 위치 파악 (이름/코드/색상 컬럼이 명시된 경우에만 사용)
+    color_col = name_col = code_col = None
+    for idx, row in enumerate(table[:5]):
         if not row:
             continue
-        
+        upper_cells = [str(c or "").upper() for c in row]
+        if any("COLOR" in c or "COLOUR" in c for c in upper_cells) and "CODE" in " ".join(upper_cells):
+            for c_idx, raw in enumerate(upper_cells):
+                if color_col is None and ("COLOR" in raw or "COLOUR" in raw):
+                    color_col = c_idx
+                if name_col is None and ("NAME" in raw or "DESC" in raw):
+                    name_col = c_idx
+                if code_col is None and "CODE" in raw:
+                    code_col = c_idx
+            break
+
+    pending_code: Optional[str] = None
+
+    for row_idx, row in enumerate(table):
+        if not row:
+            continue
+
         found_code = None
-        for cell in row:
-            if not cell:
-                continue
-            cell_text = str(cell).strip().upper()
+        for col_idx, cell in enumerate(row):
+            cell_text_raw = str(cell or "").strip()
+            cell_text = cell_text_raw.upper()
             for pattern in emergency_patterns:
                 match = pattern.search(cell_text)
                 if match:
@@ -2049,24 +2244,208 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
                     break
             if found_code:
                 break
-        
+
         if found_code:
-            code_map[found_code] = {"color": "", "name": ""}
-    
+            # 헤더가 없으면 현재 위치로 code_col 추론
+            if code_col is None:
+                try:
+                    code_col = row.index(next(cell for cell in row if str(cell or "").upper().find(found_code) != -1))
+                except StopIteration:
+                    code_col = None
+
+            # 헤더에서 NAME을 못 찾았지만 COLOR, CODE가 둘 다 있으면 사이 컬럼을 이름 후보로 사용
+            if name_col is None and color_col is not None and code_col is not None and color_col != code_col:
+                between = list(range(min(color_col, code_col) + 1, max(color_col, code_col)))
+                if between:
+                    sample_row = table[min(row_idx, len(table) - 1)]
+                    best_col = None
+                    best_len = 0
+                    for c_idx in between:
+                        if c_idx >= len(sample_row):
+                            continue
+                        cand = str(sample_row[c_idx] or "").strip()
+                        if not cand or cand.upper() in color_keywords:
+                            continue
+                        if re.fullmatch(r'[0-9./-]+', cand):
+                            continue
+                        if len(cand) > best_len:
+                            best_len = len(cand)
+                            best_col = c_idx
+                    if best_col is not None:
+                        name_col = best_col
+
+            color_val = ""
+            name_parts: List[str] = []
+
+            if color_col is not None and color_col < len(row):
+                color_val = str(row[color_col] or "").strip().upper()
+
+            if not color_val:
+                # 코드 셀 좌/우를 탐색해 색상 키워드 찾기
+                for c_idx, cell in enumerate(row):
+                    if c_idx == code_col:
+                        continue
+                    cell_upper = str(cell or "").upper()
+                    words = re.split(r'[\s/\\,+-]+', cell_upper)
+                    for w in words:
+                        if w in color_keywords:
+                            color_val = w
+                            break
+                    if color_val:
+                        break
+
+            if name_col is not None and name_col < len(row):
+                raw_name = str(row[name_col] or "").strip()
+                if raw_name:
+                    name_parts.append(raw_name)
+
+                # 색상과 코드 사이에 있는 텍스트를 모두 이름으로 병합 (표에서 NAME 헤더가 없더라도 대응)
+                side_a, side_b = (color_col, code_col) if color_col is not None else (name_col, code_col)
+                if side_a is not None and side_b is not None:
+                    start, end = sorted((side_a, side_b))
+                    for extra_idx in range(start + 1, end):
+                        if extra_idx in (color_col, code_col, name_col):
+                            continue
+                        extra = str(row[extra_idx] or "").strip()
+                        if extra and not re.fullmatch(r'[0-9./-]+', extra):
+                            name_parts.append(extra)
+                else:
+                    for extra_idx in range(name_col + 1, len(row)):
+                        if extra_idx == code_col:
+                            continue
+                        extra = str(row[extra_idx] or "").strip()
+                        if extra and not re.fullmatch(r'[0-9./-]+', extra):
+                            name_parts.append(extra)
+
+            name_val = _clean_em_name(" ".join(name_parts))
+
+            if not name_val:
+                if name_col is None and color_col is not None and code_col is not None and color_col != code_col:
+                    between_parts = []
+                    start, end = sorted((color_col, code_col))
+                    for c_idx in range(start + 1, end):
+                        if c_idx in (color_col, code_col):
+                            continue
+                        cell_text = str(row[c_idx] or "").strip()
+                        cell_upper = cell_text.upper()
+                        if not cell_text or cell_upper in color_keywords:
+                            continue
+                        if re.fullmatch(r'[0-9./-]+', cell_text):
+                            continue
+                        between_parts.append(cell_text)
+                    if between_parts:
+                        name_val = _clean_em_name(' '.join(between_parts))
+
+                # 헤더가 없을 때: 코드 셀을 제외한 다른 셀을 모두 이름 후보로 사용
+                for c_idx, cell in enumerate(row):
+                    if c_idx == code_col:
+                        continue
+                    cell_text = str(cell or "").strip()
+                    cell_upper = cell_text.upper()
+                    if not cell_text:
+                        continue
+                    if cell_upper in color_keywords:
+                        continue
+                    if re.fullmatch(r'[0-9./-]+', cell_text):
+                        continue
+                    name_val = name_val + (' ' if name_val else '') + cell_text
+                name_val = _clean_em_name(name_val)
+
+            # look ahead to capture continuation rows that hold more name text
+            lookahead_idx = row_idx + 1
+            while lookahead_idx < len(table):
+                next_row = table[lookahead_idx]
+                lookahead_idx += 1
+                if not next_row:
+                    continue
+
+                next_cells_upper = [str(c or "").upper() for c in next_row]
+                if any(pat.search(cu) for cu in next_cells_upper for pat in emergency_patterns):
+                    break
+
+                extra_parts: List[str] = []
+                if name_col is not None and name_col < len(next_row):
+                    cand = str(next_row[name_col] or "").strip()
+                    if cand:
+                        extra_parts.append(cand)
+
+                if not extra_parts:
+                    for c_idx, cell in enumerate(next_row):
+                        if c_idx in (code_col, color_col):
+                            continue
+                        cell_text = str(cell or "").strip()
+                        cell_upper = cell_text.upper()
+                        if not cell_text or cell_upper in color_keywords:
+                            continue
+                        if re.fullmatch(r'[0-9./-]+', cell_text):
+                            continue
+                        extra_parts.append(cell_text)
+
+                if extra_parts:
+                    extra = _clean_em_name(' '.join(extra_parts))
+                    if extra:
+                        name_val = (name_val + ' ' if name_val else '') + extra
+                else:
+                    continue
+
+            name_val = _clean_em_name(name_val)
+
+            code_map[found_code] = {"color": color_val, "name": name_val}
+            pending_code = found_code
+        else:
+            if pending_code and pending_code in code_map and name_col is not None:
+                continuation = str(row[name_col] or "").strip() if name_col < len(row) else ""
+                if continuation:
+                    extra = _clean_em_name(continuation)
+                    if extra:
+                        if code_map[pending_code]["name"]:
+                            code_map[pending_code]["name"] += " " + extra
+                        else:
+                            code_map[pending_code]["name"] = extra
+            elif pending_code and pending_code in code_map and name_col is None:
+                # 이름 컬럼을 찾지 못했을 때 이어지는 행도 이름에 병합
+                extra_parts = []
+                for cell in row:
+                    cell_text = str(cell or "").strip()
+                    cell_upper = cell_text.upper()
+                    if not cell_text:
+                        continue
+                    if cell_upper in color_keywords:
+                        continue
+                    if any(pat.search(cell_upper) for pat in emergency_patterns):
+                        continue
+                    extra_parts.append(cell_text)
+                if extra_parts:
+                    extra = _clean_em_name(' '.join(extra_parts))
+                    if extra:
+                        if code_map[pending_code]["name"]:
+                            code_map[pending_code]["name"] += " " + extra
+                        else:
+                            code_map[pending_code]["name"] = extra
+
     return code_map
 
 
 def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
     """MCCB/FEEDER/GSP 페이지에서 Emergency Circuit 추출"""
     all_circuits = []
-    max_scan_pages = min(len(pdf.pages), 60)
+    max_scan_pages = min(len(pdf.pages), 80)
     circuit_pattern = re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I)
-    
+
     for page_idx in range(max_scan_pages):
         page = pdf.pages[page_idx]
         text = page.extract_text() or ""
         text_upper = text.upper()
-        
+
+        tables = page.extract_tables() or []
+        header_snapshot = ""
+        if tables:
+            head_rows = []
+            for tbl in tables[:2]:
+                for r in tbl[:3]:
+                    head_rows.append(" ".join(str(c or "") for c in (r or [])[:8]))
+            header_snapshot = " ".join(head_rows)
+
         is_circuit_page = False
         if "NAME PLATE" in text_upper and "MCCB" in text_upper:
             is_circuit_page = True
@@ -2076,14 +2455,33 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
         elif circuit_pattern.search(text_upper) and "REMARKS" in text_upper:
             if any(kw in text_upper for kw in ['FEEDER', 'PANEL', 'GSP', 'GROUP STARTER']):
                 is_circuit_page = True
-        
+
+        if not is_circuit_page and tables:
+            joined_header = header_snapshot.upper()
+            if circuit_pattern.search(joined_header):
+                is_circuit_page = True
+            else:
+                circuit_hits = 0
+                for tbl in tables:
+                    for row in tbl:
+                        for cell in (row or []):
+                            if cell and circuit_pattern.search(str(cell).upper()):
+                                circuit_hits += 1
+                                if circuit_hits >= 2:
+                                    break
+                        if circuit_hits >= 2:
+                            break
+                    if circuit_hits >= 2:
+                        break
+                if circuit_hits >= 2:
+                    is_circuit_page = True
+
         if not is_circuit_page:
             continue
-        
-        panel_name, doc_type = _detect_emergency_panel_info(text)
+
+        panel_name, doc_type = _detect_emergency_panel_info(text + " " + header_snapshot)
         print(f"[DEBUG] Page {page_idx + 1}: {panel_name} ({doc_type})")
-        
-        tables = page.extract_tables()
+
         if tables:
             for table_idx, table in enumerate(tables):
                 circuits = _parse_emergency_circuit_table(table, panel_name, doc_type, page_idx + 1)
@@ -2092,7 +2490,7 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
                     for c in circuits:
                         print(f"     {c['circuit_no']} → {c['code']}")
                 all_circuits.extend(circuits)
-    
+
     return all_circuits
 
 
@@ -2129,30 +2527,35 @@ def _detect_emergency_panel_info(text: str) -> Tuple[str, str]:
 
 
 def _parse_emergency_circuit_table(
-    table: List[List], 
-    panel_name: str, 
-    doc_type: str, 
+    table: List[List],
+    panel_name: str,
+    doc_type: str,
     page_num: int
 ) -> List[Dict[str, str]]:
     """Circuit 테이블에서 Emergency 관련 Circuit 추출"""
     if not table or len(table) < 2:
         return []
-    
+
     circuits = []
     header_idx = None
     cir_no_col = None
     cir_name_col = None
     remarks_col = None
-    
+    emcy_col = None
+    control_col = None
+    code_cols: List[int] = []
+
+    col_count = max((len(r) for r in table if r), default=0)
+
     for idx, row in enumerate(table[:20]):
         if not row:
             continue
-        
+
         row_text = ' '.join([str(cell or '').upper() for cell in row])
-        
+
         if 'CIR' in row_text or 'CIRCUIT' in row_text or 'NAME PLATE' in row_text:
             header_idx = idx
-            
+
             for col_idx in range(len(row) - 1, -1, -1):
                 cell = row[col_idx]
                 if not cell:
@@ -2161,32 +2564,43 @@ def _parse_emergency_circuit_table(
                 if 'REMARK' in cell_upper and remarks_col is None:
                     remarks_col = col_idx
                     break
-            
+
             for col_idx, cell in enumerate(row):
                 if not cell:
                     continue
                 cell_upper = str(cell).upper().strip()
-                
+
+                if re.search(r"EM'?CY|EMERGENCY", cell_upper):
+                    if emcy_col is None:
+                        emcy_col = col_idx
+                    code_cols.append(col_idx)
+                if 'STOP' in cell_upper or 'CONTROL' in cell_upper or 'REMARK' in cell_upper:
+                    code_cols.append(col_idx)
+                if 'CONTROL' in cell_upper and control_col is None:
+                    control_col = col_idx
+
+            for col_idx, cell in enumerate(row):
+                if not cell:
+                    continue
+                cell_upper = str(cell).upper().strip()
+
                 if 'NO' in cell_upper and ('CIR' in cell_upper or 'CIRCUIT' in cell_upper):
                     if 'NAME' not in cell_upper and 'TYPE' not in cell_upper:
                         cir_no_col = col_idx
-                
-                if 'NAME' in cell_upper:
-                    if 'CIR' in cell_upper or 'CIRCUIT' in cell_upper or 'BREAKER' not in cell_upper:
+
+                if 'NAME' in cell_upper or 'LOAD' in cell_upper:
+                    if 'BREAKER' not in cell_upper:
                         if cir_name_col is None:
                             cir_name_col = col_idx
-            
+
             if cir_no_col is not None:
                 break
-    
-    if header_idx is None or cir_no_col is None:
-        return []
-    
+
     circuit_patterns = [
         re.compile(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', re.I),
         re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I),
     ]
-    
+
     emergency_code_patterns = [
         re.compile(r'\b(ES-\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-\d+[A-Z]?)\b', re.I),
@@ -2196,6 +2610,73 @@ def _parse_emergency_circuit_table(
         re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
     ]
+
+    if cir_no_col is None:
+        hits = [0] * col_count
+        for row in table:
+            if not row:
+                continue
+            for idx, cell in enumerate(row):
+                if idx >= col_count:
+                    continue
+                cell_text = str(cell or '')
+                if any(p.search(cell_text) for p in circuit_patterns):
+                    hits[idx] += 1
+        if any(hits):
+            cir_no_col = max(range(len(hits)), key=lambda i: hits[i])
+
+    if remarks_col is None and header_idx is not None and table[header_idx]:
+        for col_idx in range(len(table[header_idx]) - 1, -1, -1):
+            if str(table[header_idx][col_idx] or '').strip():
+                remarks_col = col_idx
+                break
+
+    if not code_cols:
+        code_hits = [0] * col_count
+        for row in table:
+            if not row:
+                continue
+            for idx, cell in enumerate(row):
+                if idx >= col_count:
+                    continue
+                cell_text = str(cell or '')
+                if _extract_codes_from_text(cell_text, emergency_code_patterns):
+                    code_hits[idx] += 1
+        for idx, hit in enumerate(code_hits):
+            if hit:
+                code_cols.append(idx)
+
+    if remarks_col is not None:
+        code_cols.append(remarks_col)
+    if control_col is not None:
+        code_cols.append(control_col)
+    if emcy_col is not None:
+        code_cols.append(emcy_col)
+
+    code_cols = sorted(set([c for c in code_cols if c is not None]))
+
+    if cir_name_col is None and cir_no_col is not None:
+        name_scores = [0] * col_count
+        for row in table:
+            if not row:
+                continue
+            for idx, cell in enumerate(row):
+                if idx >= col_count or idx == cir_no_col:
+                    continue
+                cell_text = str(cell or '').strip()
+                if not cell_text:
+                    continue
+                if re.fullmatch(r'[0-9./-]+', cell_text):
+                    continue
+                letter_count = len(re.sub(r'[^A-Za-z]', '', cell_text))
+                name_scores[idx] += letter_count + len(cell_text) * 0.1
+        if any(name_scores):
+            cir_name_col = max(range(len(name_scores)), key=lambda i: name_scores[i])
+
+    start_row = header_idx + 1 if header_idx is not None else 0
+
+    if cir_no_col is None or start_row >= len(table):
+        return []
     
     for row_idx in range(header_idx + 1, len(table)):
         row = table[row_idx]
@@ -2215,18 +2696,35 @@ def _parse_emergency_circuit_table(
         if not circuit_no:
             continue
         
-        code_from_remarks = ""
-        if remarks_col is not None and remarks_col < len(row):
-            remarks_text = str(row[remarks_col] or '').strip().upper()
-            for pattern in emergency_code_patterns:
-                match = pattern.search(remarks_text)
-                if match:
-                    code_from_remarks = match.group(1).upper()
-                    if '-' not in code_from_remarks and re.match(r'[A-Z]{2,4}\d+', code_from_remarks):
-                        code_from_remarks = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code_from_remarks)
-                    break
-        
-        if not code_from_remarks:
+        codes_from_remarks: List[str] = []
+
+        def _extend_codes(text: str):
+            for code in _extract_codes_from_text(text, emergency_code_patterns):
+                if code not in codes_from_remarks:
+                    codes_from_remarks.append(code)
+
+        for col_idx in code_cols:
+            if col_idx < len(row):
+                cell_text = str(row[col_idx] or '').strip()
+                if cell_text:
+                    _extend_codes(cell_text)
+
+        if not codes_from_remarks:
+            # REMARKS/CONTROL 컬럼이 없을 때도 다른 셀에서 CODE를 회수
+            for c_idx, cell in enumerate(row):
+                if c_idx == cir_no_col:
+                    continue
+                cell_text = str(cell or '').strip()
+                _extend_codes(cell_text)
+
+        if not codes_from_remarks:
+            # 테이블 컬럼 감지가 빗나갔을 때, 회로번호를 제외한 전체 행 텍스트에서 재시도
+            row_text = ' '.join(str(cell or '') for idx, cell in enumerate(row) if idx != cir_no_col)
+            for code in _extract_codes_from_text(row_text, emergency_code_patterns):
+                if code not in codes_from_remarks:
+                    codes_from_remarks.append(code)
+
+        if not codes_from_remarks:
             continue
         
         circuit_name = ""
@@ -2237,15 +2735,31 @@ def _parse_emergency_circuit_table(
             if name_cell and len(name_cell) > 1:
                 circuit_name = name_cell
         
-        if not circuit_name and row_idx + 1 < len(table):
+        if not circuit_name and cir_name_col is not None and row_idx + 1 < len(table):
             next_row = table[row_idx + 1]
             if cir_name_col < len(next_row):
                 next_name = str(next_row[cir_name_col] or '').strip()
                 has_next_circuit = any(pattern.search(str(next_row[cir_no_col] or '')) for pattern in circuit_patterns) if cir_no_col < len(next_row) else False
                 if not has_next_circuit and len(next_name) > 1:
                     circuit_name = next_name
-        
-        if circuit_name:
+
+        if not circuit_name:
+            # 다른 컬럼의 텍스트도 회수하여 최소한 이름 단서를 확보
+            fallback_cells = []
+            for idx, cell in enumerate(row):
+                if idx in (cir_no_col, remarks_col, emcy_col):
+                    continue
+                cell_text = str(cell or '').strip()
+                if len(cell_text) < 2:
+                    continue
+                if re.fullmatch(r'[0-9./-]+', cell_text):
+                    continue
+                fallback_cells.append(cell_text)
+
+            if fallback_cells:
+                circuit_name = re.sub(r'\s+', ' ', ' '.join(fallback_cells)).strip()
+
+        for code_from_remarks in codes_from_remarks:
             circuits.append({
                 'circuit_no': circuit_no,
                 'circuit_name': circuit_name,
@@ -2253,17 +2767,27 @@ def _parse_emergency_circuit_table(
                 'doc_type': doc_type,
                 'code': code_from_remarks
             })
-    
-    return circuits
+
+    # 동일 코드/회로 조합의 중복을 제거하면서 더 긴 회로명을 보존
+    deduped = {}
+    for c in circuits:
+        key = (c['code'], c['circuit_no'], c['panel'], c['doc_type'])
+        if key not in deduped:
+            deduped[key] = c
+        else:
+            if len(c.get('circuit_name', '')) > len(deduped[key].get('circuit_name', '')):
+                deduped[key] = c
+
+    return list(deduped.values())
 
 
 def _group_emergency_by_code(
-    circuits: List[Dict[str, str]], 
+    circuits: List[Dict[str, str]],
     code_info_map: Dict[str, Dict[str, str]]
 ) -> List[Dict[str, object]]:
     """CODE별로 Circuit 그룹화 (GSP/MSBD 구분 표시)"""
     code_circuits = {}
-    
+
     code_variations = {}
     for code in code_info_map.keys():
         normalized = code.replace('-', '').replace(' ', '').upper()
@@ -2282,7 +2806,7 @@ def _group_emergency_by_code(
             normalized = circuit_code.replace('-', '').replace(' ', '')
             if normalized in code_variations:
                 matched_code = code_variations[normalized]
-        
+
         if not matched_code:
             continue
         
@@ -2291,12 +2815,15 @@ def _group_emergency_by_code(
         
         doc_type = circuit.get('doc_type', 'MSBD')
         target_list = code_circuits[matched_code]['gsp'] if doc_type == 'GSP' else code_circuits[matched_code]['msbd']
-        
-        target_list.append({
-            'circuit_no': circuit.get('circuit_no', ''),
-            'circuit_name': circuit.get('circuit_name', ''),
-            'panel': circuit.get('panel', '')
-        })
+
+        circuit_no_val = circuit.get('circuit_no', '')
+        panel_val = circuit.get('panel', '')
+        if not any(c.get('circuit_no') == circuit_no_val and c.get('panel') == panel_val for c in target_list):
+            target_list.append({
+                'circuit_no': circuit_no_val,
+                'circuit_name': circuit.get('circuit_name', ''),
+                'panel': panel_val
+            })
     
     result = []
     
@@ -2308,10 +2835,11 @@ def _group_emergency_by_code(
         gsp_circuits = code_circuits.get(code, {}).get('gsp', [])
         msbd_circuits = code_circuits.get(code, {}).get('msbd', [])
         
-        if not name:
-            all_circuits = gsp_circuits + msbd_circuits
-            if all_circuits:
-                name = max([c['circuit_name'] for c in all_circuits], key=len)
+        all_circuits = gsp_circuits + msbd_circuits
+        if (not name or len(name) < 8) and all_circuits:
+            longest = max([c.get('circuit_name', '') for c in all_circuits], key=len)
+            if len(longest) > len(name):
+                name = longest
         
         groups = []
         
