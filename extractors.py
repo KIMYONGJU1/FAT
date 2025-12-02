@@ -2129,9 +2129,9 @@ def _detect_emergency_panel_info(text: str) -> Tuple[str, str]:
 
 
 def _parse_emergency_circuit_table(
-    table: List[List], 
-    panel_name: str, 
-    doc_type: str, 
+    table: List[List],
+    panel_name: str,
+    doc_type: str,
     page_num: int
 ) -> List[Dict[str, str]]:
     """Circuit 테이블에서 Emergency 관련 Circuit 추출"""
@@ -2185,16 +2185,14 @@ def _parse_emergency_circuit_table(
     circuit_patterns = [
         re.compile(r'P\d{2}-\d{3}-\d{2}-[A-Z]{2}', re.I),
         re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I),
+        re.compile(r'P\d{1,2}-\d{2,3}-\d{1,2}-[A-Z]{2,3}', re.I),
     ]
-    
+
     emergency_code_patterns = [
-        re.compile(r'\b(ES-\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(CO2-\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(PT-\d+)\b', re.I),
-        re.compile(r'\b(FOAM-\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(ES\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(ES[-\s]?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(CO2[-\s]?\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(PT[-\s]?\d+)\b', re.I),
+        re.compile(r'\b(FOAM[-\s]?\d+[A-Z]?)\b', re.I),
     ]
     
     for row_idx in range(header_idx + 1, len(table)):
@@ -2202,31 +2200,51 @@ def _parse_emergency_circuit_table(
         if not row:
             continue
         
+        row_text_full = ' '.join([str(cell or '') for cell in row])
         cir_no_cell = str(row[cir_no_col] or '').strip() if cir_no_col < len(row) else ""
         circuit_match = None
         circuit_no = ""
-        
+
         for pattern in circuit_patterns:
             circuit_match = pattern.search(cir_no_cell)
             if circuit_match:
                 circuit_no = circuit_match.group(0).upper()
                 break
-        
+
+        if not circuit_no:
+            row_upper_text = row_text_full.upper()
+            for pattern in circuit_patterns:
+                circuit_match = pattern.search(row_upper_text)
+                if circuit_match:
+                    circuit_no = circuit_match.group(0).upper()
+                    break
+
         if not circuit_no:
             continue
-        
-        code_from_remarks = ""
+
+        def _normalize_code(raw: str) -> str:
+            code = raw.upper().replace(' ', '')
+            if '-' not in code and re.match(r'[A-Z]{2,4}\d+', code):
+                code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code)
+            code = code.replace('--', '-')
+            return code
+
+        codes_found: List[str] = []
         if remarks_col is not None and remarks_col < len(row):
             remarks_text = str(row[remarks_col] or '').strip().upper()
             for pattern in emergency_code_patterns:
-                match = pattern.search(remarks_text)
-                if match:
-                    code_from_remarks = match.group(1).upper()
-                    if '-' not in code_from_remarks and re.match(r'[A-Z]{2,4}\d+', code_from_remarks):
-                        code_from_remarks = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', code_from_remarks)
-                    break
-        
-        if not code_from_remarks:
+                for match in pattern.finditer(remarks_text):
+                    codes_found.append(_normalize_code(match.group(1)))
+
+        if not codes_found:
+            row_upper_text = row_text_full.upper()
+            for pattern in emergency_code_patterns:
+                for match in pattern.finditer(row_upper_text):
+                    codes_found.append(_normalize_code(match.group(1)))
+
+        codes_found = list(dict.fromkeys([code for code in codes_found if code]))
+
+        if not codes_found:
             continue
         
         circuit_name = ""
@@ -2246,13 +2264,14 @@ def _parse_emergency_circuit_table(
                     circuit_name = next_name
         
         if circuit_name:
-            circuits.append({
-                'circuit_no': circuit_no,
-                'circuit_name': circuit_name,
-                'panel': panel_name,
-                'doc_type': doc_type,
-                'code': code_from_remarks
-            })
+            for code in codes_found:
+                circuits.append({
+                    'circuit_no': circuit_no,
+                    'circuit_name': circuit_name,
+                    'panel': panel_name,
+                    'doc_type': doc_type,
+                    'code': code
+                })
     
     return circuits
 
