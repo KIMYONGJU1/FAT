@@ -1,6 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-FAT AutoFill Extractors (v2.4.4 - Emergency Circuit REMARKS 집중)
+FAT AutoFill Extractors (v2.5.0 - EMERGENCY STOP 추출 개선)
+
+v2.5.0 개선사항:
+- FOAM 코드 정규화: FOAM1A -> FOAM-1A 자동 변환
+- 여러 줄로 나뉜 코드 인식: 한 칸에 CO2-4, FOAM-2A, ES-4가 세로로 배치된 경우 모두 인식
+- 코드 패턴 강화: FOAM-?\d+[A-Z]? 패턴으로 하이픈 있/없는 경우 모두 인식
+- _normalize_code 함수 개선: FOAM, ES, CO2 등 모든 코드 정규화
+- _extract_codes_from_text 함수 개선: 줄바꿈(\n, \r) 처리 추가
+
+기존 기능:
 - REMARKS 컬럼에서 Emergency CODE 추출
 - MSBD/GSP NAME PLATE (MCCB) 페이지 정확히 파싱
 - Circuit 매칭 여부와 상관없이 모든 CODE 표시
@@ -155,22 +164,42 @@ def clean_num(s: str) -> str:
 
 
 def _normalize_code(raw: str) -> Optional[str]:
+    """
+    코드 정규화 함수 (v2.0 개선)
+    - FOAM1A -> FOAM-1A 자동 변환
+    - ES1A -> ES-1A 자동 변환
+    """
     token = (raw or "").strip().upper()
     if not token:
         return None
     token = token.replace('–', '-').replace('—', '-').replace('_', '-')
     token = re.sub(r'\s+', '', token)
+    
+    # FOAM 코드 정규화: FOAM1A -> FOAM-1A
+    if token.startswith('FOAM') and '-' not in token:
+        m = re.match(r'^(FOAM)(\d+[A-Z]?)$', token)
+        if m:
+            token = f"{m.group(1)}-{m.group(2)}"
+    
+    # 기타 코드에서 하이픈 추가
     if '-' not in token and re.match(r'[A-Z]{2,4}\d+', token):
         token = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', token)
+    
     if not re.search(r'\d', token):
         return None
     return token
 
 
 def _extract_codes_from_text(text: str, patterns: List[re.Pattern]) -> List[str]:
+    """
+    텍스트에서 EMERGENCY CODE 추출 (v2.0 개선)
+    - 정규화 강화: FOAM1A -> FOAM-1A
+    - 중복 제거
+    """
     found: List[str] = []
     seen = set()
     txt = (text or "").upper()
+    
     # direct regex matches
     for pat in patterns:
         for m in pat.finditer(txt):
@@ -178,12 +207,14 @@ def _extract_codes_from_text(text: str, patterns: List[re.Pattern]) -> List[str]
             if norm and norm not in seen:
                 seen.add(norm)
                 found.append(norm)
-    # token-based fallback
-    for token in re.split(r'[\s,;/]+', txt):
+    
+    # token-based fallback (쉼표, 슬래시, 줄바꿈 등으로 구분된 경우)
+    for token in re.split(r'[\s,;/\n\r]+', txt):
         norm = _normalize_code(token)
         if norm and norm not in seen:
             seen.add(norm)
             found.append(norm)
+    
     return found
 
 
@@ -2189,8 +2220,8 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
                 match = pattern.search(cell_text)
                 if match:
                     found_code = match.group(1).upper()
-                    if '-' not in found_code and re.match(r'[A-Z]{2,4}\d+', found_code):
-                        found_code = re.sub(r'^([A-Z]+)(\d+)', r'\1-\2', found_code)
+                    # _normalize_code 함수 사용으로 통일 (FOAM1A -> FOAM-1A 자동 변환)
+                    found_code = _normalize_code(found_code)
                     break
             if found_code:
                 break
@@ -2379,7 +2410,7 @@ def _parse_colorplate_table(table: List[List], table_idx: int) -> Dict[str, Dict
 def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
     """MCCB/FEEDER/GSP 페이지에서 Emergency Circuit 추출"""
     all_circuits = []
-    max_scan_pages = min(len(pdf.pages), 60)
+    max_scan_pages = min(len(pdf.pages), 100)  # 60 → 100으로 확대
     circuit_pattern = re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I)
     
     for page_idx in range(max_scan_pages):
@@ -2390,6 +2421,11 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
         is_circuit_page = False
         if "NAME PLATE" in text_upper and "MCCB" in text_upper:
             is_circuit_page = True
+        elif "EMERGENCY STOP" in text_upper and "PANEL" in text_upper:
+            # EMERGENCY STOP PANEL 페이지 감지 추가!
+            if circuit_pattern.search(text_upper):
+                is_circuit_page = True
+                print(f"  [INFO] EMERGENCY STOP PANEL 감지")
         elif "SPECIFICATION" in text_upper and "LIST" in text_upper:
             if circuit_pattern.search(text_upper):
                 is_circuit_page = True
@@ -2398,20 +2434,58 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
                 is_circuit_page = True
         
         if not is_circuit_page:
+            # 디버그: P31-027이나 P32-027이 있는데 스캔 안하는 페이지 찾기
+            if 'P31-027' in text_upper or 'P32-027' in text_upper:
+                print(f"  [WARNING] Page {page_idx + 1}: P31-027/P32-027 있지만 스캔 안함")
+                print(f"            키워드: NAME PLATE={('NAME PLATE' in text_upper)}, EMERGENCY STOP={('EMERGENCY STOP' in text_upper)}")
             continue
         
         panel_name, doc_type = _detect_emergency_panel_info(text)
         print(f"[DEBUG] Page {page_idx + 1}: {panel_name} ({doc_type})")
         
+        # P31-027 또는 P32-027 존재 체크
+        has_027 = 'P31-027' in text_upper or 'P32-027' in text_upper
+        if has_027:
+            print(f"  ⭐ P31-027/P32-027 발견!")
+        
+        # 표 추출 (기본 설정 사용)
         tables = page.extract_tables()
+        
+        # 표 추출 실패 또는 너무 적을 경우 대안 시도
+        if not tables or len(tables) < 2:
+            print(f"  [INFO] 기본 설정 결과: {len(tables) if tables else 0}개 표")
+            # 대안 1: explicit_vertical_lines 사용
+            alt_tables = page.extract_tables({
+                "vertical_strategy": "explicit",
+                "horizontal_strategy": "explicit",
+                "intersection_tolerance": 10,
+            })
+            if alt_tables and len(alt_tables) > len(tables if tables else []):
+                print(f"  [INFO] 대안 설정 사용: {len(alt_tables)}개 표")
+                tables = alt_tables
+        
         if tables:
+            print(f"  [INFO] 최종 표 개수: {len(tables)}")
             for table_idx, table in enumerate(tables):
+                # 표 헤더 출력 (디버깅용)
+                if table and len(table) > 0:
+                    header = table[0] if table[0] else []
+                    header_str = ' | '.join([str(h or '')[:15] for h in header[:5]])  # 처음 5개 컬럼, 각 15자 제한
+                    print(f"  [TABLE {table_idx + 1}] 헤더: {header_str}")
+                
                 circuits = _parse_emergency_circuit_table(table, panel_name, doc_type, page_idx + 1)
                 if circuits:
-                    print(f"  └─ Table {table_idx + 1}: {len(circuits)} circuits")
-                    for c in circuits:
+                    print(f"  └─ Table {table_idx + 1}: ✓ {len(circuits)} circuits")
+                    # 처음 10개만 출력 (로그 간소화)
+                    for c in circuits[:10]:
                         print(f"     {c['circuit_no']} → {c['code']}")
+                    if len(circuits) > 10:
+                        print(f"     ... 외 {len(circuits) - 10}개")
+                else:
+                    print(f"  └─ Table {table_idx + 1}: ✗ 0 circuits")
                 all_circuits.extend(circuits)
+        else:
+            print(f"  [ERROR] 표를 찾을 수 없음")
     
     return all_circuits
 
@@ -2475,24 +2549,37 @@ def _parse_emergency_circuit_table(
         if 'CIR' in row_text or 'CIRCUIT' in row_text or 'NAME PLATE' in row_text:
             header_idx = idx
             
+            # REMARKS 컬럼 찾기 (역순)
             for col_idx in range(len(row) - 1, -1, -1):
                 cell = row[col_idx]
                 if not cell:
                     continue
                 cell_upper = str(cell).upper().strip()
+                # 너무 긴 텍스트는 제외 (ABBREVIATION 페이지 등)
+                if len(cell_upper) > 100:
+                    continue
                 if 'REMARK' in cell_upper and remarks_col is None:
                     remarks_col = col_idx
+                    print(f"    [REMK] REMARKS 컬럼: {col_idx}")
                     break
 
+            # EM'CY STOP, CONTROL 컬럼 찾기
             for col_idx, cell in enumerate(row):
                 if not cell:
                     continue
                 cell_upper = str(cell).upper().strip()
+                
+                # ABBREVIATION 페이지나 너무 긴 텍스트 제외
+                if len(cell_upper) > 200 or 'ABBREVIATION' in cell_upper or 'DESCRIPTION' in cell_upper:
+                    continue
 
-                if re.search(r"EM'?CY|EMERGENCY", cell_upper) and ('STOP' in cell_upper or 'CONTROL' in cell_upper):
-                    emcy_col = col_idx
-                if 'CONTROL' in cell_upper and control_col is None:
+                if re.search(r"EM'?CY|EMERGENCY", cell_upper) and ('STOP' in cell_upper or 'CONSUMER' in cell_upper):
+                    if emcy_col is None:  # 첫 번째 것만
+                        emcy_col = col_idx
+                        print(f"    [EMCY] EM'CY STOP 컬럼: {col_idx}")
+                if 'CONTROL' in cell_upper and 'CONTROL SWITCH' not in cell_upper and control_col is None:
                     control_col = col_idx
+                    print(f"    [CTRL] CONTROL 컬럼: {col_idx}")
             
             for col_idx, cell in enumerate(row):
                 if not cell:
@@ -2530,10 +2617,10 @@ def _parse_emergency_circuit_table(
         re.compile(r'\b(ES-\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(CO2-\d+[A-Z]?)\b', re.I),
         re.compile(r'\b(PT-\d+)\b', re.I),
-        re.compile(r'\b(FOAM-\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(ES\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),
-        re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),
+        re.compile(r'\b(FOAM-?\d+[A-Z]?)\b', re.I),  # FOAM1A, FOAM-1A 모두 인식
+        re.compile(r'\b(ES\d+[A-Z]?)\b', re.I),      # ES1A (하이픈 없음)
+        re.compile(r'\b(CO2\d+[A-Z]?)\b', re.I),     # CO24 (하이픈 없음)
+        re.compile(r'\b(FOAM\d+[A-Z]?)\b', re.I),    # FOAM1A (하이픈 없음)
     ]
     
     for row_idx in range(header_idx + 1, len(table)):
@@ -2556,12 +2643,17 @@ def _parse_emergency_circuit_table(
         
         codes_from_remarks: List[str] = []
 
+        # GSP의 EMCY STOP 컬럼 처리 (개선: 여러 줄로 나뉜 코드 모두 인식)
         if doc_type == "GSP" and emcy_col is not None and emcy_col < len(row):
             emcy_text = str(row[emcy_col] or '').strip()
+            # 줄바꿈으로 나뉜 경우도 처리
+            emcy_text = emcy_text.replace('\n', ' ').replace('\r', ' ')
             codes_from_remarks.extend(_extract_codes_from_text(emcy_text, emergency_code_patterns))
 
+        # REMARKS 컬럼 처리
         if remarks_col is not None and remarks_col < len(row):
             remarks_text = str(row[remarks_col] or '').strip()
+            remarks_text = remarks_text.replace('\n', ' ').replace('\r', ' ')
             codes_from_remarks.extend(_extract_codes_from_text(remarks_text, emergency_code_patterns))
 
         if not codes_from_remarks and control_col is not None and control_col < len(row):

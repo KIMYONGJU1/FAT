@@ -773,16 +773,46 @@ class App(tk.Tk):
             try:
                 ex.set_progress_cb(self._subprogress(80, 10))
                 
-                # 신규 범용 파서 사용
-                ems = ex.parse_emergency_stop_from_mccb(msbd)
+                # MSBD와 GSP 둘 다 스캔하고 병합
+                ems_msbd = ex.parse_emergency_stop_from_mccb(msbd) or []
+                ems_gsp = ex.parse_emergency_stop_from_mccb(gsp) or []
                 
-                # MSBD 실패 시 GSP 시도
-                if not ems:
-                    ems = ex.parse_emergency_stop_from_mccb(gsp)
+                # 두 결과 병합 (CODE가 같으면 groups를 합침)
+                if ems_msbd and ems_gsp:
+                    self.log("[INFO] MSBD와 GSP 결과 병합 중...")
+                    ems_combined = {}
+                    
+                    # MSBD 결과 먼저 추가
+                    for item in ems_msbd:
+                        code = item.get('code', '')
+                        ems_combined[code] = item
+                    
+                    # GSP 결과 병합
+                    for item in ems_gsp:
+                        code = item.get('code', '')
+                        if code in ems_combined:
+                            # 기존 항목에 groups 추가
+                            existing_groups = ems_combined[code].get('groups', [])
+                            new_groups = item.get('groups', [])
+                            ems_combined[code]['groups'] = existing_groups + new_groups
+                            self.log(f"  [MERGE] {code}: {len(existing_groups)} + {len(new_groups)} circuits")
+                        else:
+                            # 새로운 CODE
+                            ems_combined[code] = item
+                    
+                    ems = list(ems_combined.values())
+                    self.log(f"[OK] 병합 완료: 총 {len(ems)}개 CODE")
                 
-                # 둘 다 실패 시 기존 파서
-                if not ems:
+                elif ems_msbd:
+                    ems = ems_msbd
+                    self.log("[INFO] MSBD 결과만 사용")
+                elif ems_gsp:
+                    ems = ems_gsp
+                    self.log("[INFO] GSP 결과만 사용")
+                else:
+                    # 둘 다 실패 시 기존 파서
                     ems = ex.parse_emergency_colorplate(msbd)
+                    self.log("[WARN] 기존 파서 사용 (MSBD/GSP 실패)")
                 
                 ems = ems or []
                 self._split_em_and_pt(ems)
