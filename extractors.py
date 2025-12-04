@@ -1818,10 +1818,10 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                                 full_name = full_name.replace(pending_code, "").strip()
                                 
                                 if full_name:
-                                    if not any(c["code"] == pending_code for c in panel_circuits[current_panel]):
+                                    if not any(c["circuit_no"] == pending_code for c in panel_circuits[current_panel]):
                                         panel_circuits[current_panel].append({
-                                            "code": pending_code,
-                                            "name": full_name
+                                            "circuit_no": pending_code,
+                                            "circuit_name": full_name
                                         })
 
                             pending_code = code_match.group(0).upper()
@@ -1847,10 +1847,10 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
                         full_name = full_name.replace(pending_code, "").strip()
                         
                         if full_name:
-                            if not any(c["code"] == pending_code for c in panel_circuits[current_panel]):
+                            if not any(c["circuit_no"] == pending_code for c in panel_circuits[current_panel]):
                                 panel_circuits[current_panel].append({
-                                    "code": pending_code,
-                                    "name": full_name
+                                    "circuit_no": pending_code,
+                                    "circuit_name": full_name
                                 })
 
     except Exception as e:
@@ -1868,8 +1868,8 @@ def parse_function_test_of_gsp(pdf_path: str) -> List[Dict[str, object]]:
         if not circuits:
             continue
         
-        circuits.sort(key=lambda c: c["code"])
-        content = "\n".join([f"{c['code']} {c['name']}" for c in circuits])
+        circuits.sort(key=lambda c: c["circuit_no"])
+        content = "\n".join([f"{c['circuit_no']} {c['circuit_name']}" for c in circuits])
         
         results.append({
             "panel": panel_label,
@@ -2413,6 +2413,19 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
     max_scan_pages = min(len(pdf.pages), 100)  # 60 → 100으로 확대
     circuit_pattern = re.compile(r'P\d{2}-\d{2,3}-\d{2}-[A-Z]{2}', re.I)
     
+    # PDF 파일명으로 doc_type 판단 (MSBD PDF vs GSP PDF)
+    pdf_path = getattr(pdf, 'stream', None)
+    if pdf_path and hasattr(pdf_path, 'name'):
+        pdf_filename = os.path.basename(pdf_path.name).upper()
+    else:
+        pdf_filename = ""
+    
+    # PDF 파일 레벨의 doc_type 결정
+    if "GSP" in pdf_filename:
+        pdf_doc_type = "GSP"
+    else:
+        pdf_doc_type = "MSBD"
+    
     for page_idx in range(max_scan_pages):
         page = pdf.pages[page_idx]
         text = page.extract_text() or ""
@@ -2440,7 +2453,9 @@ def _extract_emergency_circuits(pdf) -> List[Dict[str, str]]:
                 print(f"            키워드: NAME PLATE={('NAME PLATE' in text_upper)}, EMERGENCY STOP={('EMERGENCY STOP' in text_upper)}")
             continue
         
-        panel_name, doc_type = _detect_emergency_panel_info(text)
+        # panel_name만 페이지 내용으로 판단, doc_type은 PDF 파일명 기준 사용
+        panel_name, _ = _detect_emergency_panel_info(text)
+        doc_type = pdf_doc_type  # PDF 파일명 기반 doc_type 사용
         print(f"[DEBUG] Page {page_idx + 1}: {panel_name} ({doc_type})")
         
         # P31-027 또는 P32-027 존재 체크
@@ -2539,6 +2554,7 @@ def _parse_emergency_circuit_table(
     remarks_col = None
     emcy_col = None
     control_col = None
+    detected_circuit_prefix = None  # P31/P32/P33 감지용
     
     for idx, row in enumerate(table[:20]):
         if not row:
@@ -2641,6 +2657,12 @@ def _parse_emergency_circuit_table(
         if not circuit_no:
             continue
         
+        # Circuit 번호에서 P31/P32/P33 prefix 감지
+        if detected_circuit_prefix is None:
+            prefix_match = re.match(r'P(3[1-3])', circuit_no)
+            if prefix_match:
+                detected_circuit_prefix = prefix_match.group(1)  # "31", "32", "33"
+        
         codes_from_remarks: List[str] = []
 
         # GSP의 EMCY STOP 컬럼 처리 (개선: 여러 줄로 나뉜 코드 모두 인식)
@@ -2724,7 +2746,52 @@ def _parse_emergency_circuit_table(
             if len(c.get('circuit_name', '')) > len(deduped[key].get('circuit_name', '')):
                 deduped[key] = c
 
-    return list(deduped.values())
+    # ✅ doc_type + Circuit prefix 기반으로 panel_name 강제 설정 (v2.13.0)
+    # 핵심: MSBD → FEEDER PANEL, GSP → GROUP STARTER PANEL (페이지 제목 무시!)
+    corrected_circuits = []
+    
+    for c in deduped.values():
+        circuit_no = c['circuit_no']
+        doc_type = c['doc_type']
+        original_panel = c['panel']
+        
+        # Circuit prefix 추출 (P31, P32, P33 등)
+        prefix_match = re.match(r'P(3[1-3])', circuit_no)
+        if prefix_match:
+            panel_num = prefix_match.group(1)  # "31", "32", "33"
+            
+            # doc_type에 따라 panel_name 강제 설정
+            if doc_type == "MSBD":
+                # MSBD → 항상 "AC440V FEEDER PANEL"
+                if panel_num == "31":
+                    corrected_panel = "No.1 AC440V FEEDER PANEL"
+                elif panel_num == "32":
+                    corrected_panel = "No.2 AC440V FEEDER PANEL"
+                elif panel_num == "33":
+                    corrected_panel = "EMERGENCY PANEL"
+                else:
+                    corrected_panel = original_panel
+            
+            elif doc_type == "GSP":
+                # GSP → 항상 "GROUP STARTER PANEL"
+                if panel_num == "31":
+                    corrected_panel = "No.1 GROUP STARTER PANEL"
+                elif panel_num == "32":
+                    corrected_panel = "No.2 GROUP STARTER PANEL"
+                else:
+                    corrected_panel = original_panel
+            else:
+                corrected_panel = original_panel
+            
+            # 변경 로그 출력
+            if corrected_panel != original_panel:
+                print(f"  [CORRECT] {circuit_no} ({doc_type}): '{original_panel}' → '{corrected_panel}'")
+            
+            c['panel'] = corrected_panel
+        
+        corrected_circuits.append(c)
+
+    return corrected_circuits
 
 
 def _group_emergency_by_code(
@@ -2786,31 +2853,35 @@ def _group_emergency_by_code(
         
         groups = []
         
-        if gsp_circuits:
-            gsp_panel_groups = {}
-            for circuit in gsp_circuits:
-                panel = circuit['panel']
-                if panel not in gsp_panel_groups:
-                    gsp_panel_groups[panel] = []
-                gsp_panel_groups[panel].append(circuit['circuit_no'])
+        # MSBD 먼저 (No.1/No.2 AC440V FEEDER PANEL)
+        if msbd_circuits:
+            # panel_name별로 그룹화 (페이지 단위 패널명)
+            msbd_panel_groups = {}
+            for circuit in msbd_circuits:
+                panel_name = circuit['panel']  # "No.1 AC440V FEEDER PANEL"
+                if panel_name not in msbd_panel_groups:
+                    msbd_panel_groups[panel_name] = []
+                msbd_panel_groups[panel_name].append(circuit['circuit_no'])
             
-            for panel, circs in sorted(gsp_panel_groups.items()):
+            for panel_name, circs in sorted(msbd_panel_groups.items()):
                 groups.append({
-                    'panel_header': f"[GSP] {panel}",
+                    'panel_header': panel_name,  # 예: "No.1 AC440V FEEDER PANEL"
                     'circuits': sorted(set(circs))
                 })
         
-        if msbd_circuits:
-            msbd_panel_groups = {}
-            for circuit in msbd_circuits:
-                panel = circuit['panel']
-                if panel not in msbd_panel_groups:
-                    msbd_panel_groups[panel] = []
-                msbd_panel_groups[panel].append(circuit['circuit_no'])
+        # GSP 나중에 (No.1/No.2 GROUP STARTER PANEL)
+        if gsp_circuits:
+            # panel_name별로 그룹화 (페이지 단위 패널명)
+            gsp_panel_groups = {}
+            for circuit in gsp_circuits:
+                panel_name = circuit['panel']  # "No.1 GROUP STARTER PANEL"
+                if panel_name not in gsp_panel_groups:
+                    gsp_panel_groups[panel_name] = []
+                gsp_panel_groups[panel_name].append(circuit['circuit_no'])
             
-            for panel, circs in sorted(msbd_panel_groups.items()):
+            for panel_name, circs in sorted(gsp_panel_groups.items()):
                 groups.append({
-                    'panel_header': f"[MSBD] {panel}",
+                    'panel_header': panel_name,  # 예: "No.1 GROUP STARTER PANEL"
                     'circuits': sorted(set(circs))
                 })
         

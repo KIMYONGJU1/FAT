@@ -7,7 +7,7 @@ FAT AutoFill Pro (v2.4.2_fix13b)
 """
 from __future__ import annotations
 
-APP_NAME = "FAT AutoFill Pro (v2.4.2_fix13c)"
+APP_NAME = "FAT AutoFill Pro (v3.4.3_TEMPLATE_PRESERVATION_FIX)"
 
 import os
 import re
@@ -29,6 +29,10 @@ def DocxTemplate(*args, **kwargs):
 
 
 import extractors as ex
+from docx import Document
+from copy import deepcopy
+import tempfile
+
 
 FIELDS = [
     "customer","hull_no","owner","class","Kind_of_Vessel","item",
@@ -121,6 +125,429 @@ def combine_all(a: Dict[str,str], b: Dict[str,str]) -> Dict[str,str]:
         if v and not out.get(k):
             out[k] = v
     return out
+
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DynamicTemplateFiller - 동적 행 생성 (v3.3.0 FINAL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+class DynamicTemplateFiller:
+    """Word 템플릿의 샘플 행을 복제해서 데이터 개수만큼 행 생성"""
+    
+    # ✅ v3.4.7: 범용 Circuit No 패턴 (모든 프로젝트 지원)
+    CIRCUIT_NO_PATTERN = re.compile(r'^[A-Z]\d{2}-\d{3}-\d{2}-PN$')
+    
+    def __init__(self, doc_path):
+        if isinstance(doc_path, str):
+            self.doc = Document(doc_path)
+        else:
+            self.doc = doc_path
+    
+    @staticmethod
+    def is_valid_circuit_no(circuit_no):
+        """
+        Circuit No 유효성 검사 (범용)
+        
+        Args:
+            circuit_no: Circuit 번호 (예: P31-021-01-PN, P42-015-03-PN, S11-023-02-PN)
+        
+        Returns:
+            bool: 유효하면 True
+        
+        Examples:
+            >>> is_valid_circuit_no('P31-021-01-PN')  # SN2670 프로젝트
+            True
+            >>> is_valid_circuit_no('P42-015-03-PN')  # 다른 프로젝트
+            True
+            >>> is_valid_circuit_no('S11-023-02-PN')  # 다른 프로젝트
+            True
+            >>> is_valid_circuit_no('15')  # 숫자만
+            False
+            >>> is_valid_circuit_no('NO.1')  # 텍스트만
+            False
+        """
+        if not circuit_no or not isinstance(circuit_no, str):
+            return False
+        return bool(DynamicTemplateFiller.CIRCUIT_NO_PATTERN.match(circuit_no))
+    
+    @staticmethod
+    def get_panel_number(circuit_no):
+        """
+        Circuit No에서 Panel 번호 추출 (1 또는 2)
+        
+        Args:
+            circuit_no: Circuit 번호 (예: P31-021-01-PN, P32-015-03-PN)
+        
+        Returns:
+            int: Panel 번호 (1 또는 2), 실패 시 None
+        
+        Logic:
+            - 두 번째 숫자가 홀수 → NO.1
+            - 두 번째 숫자가 짝수 → NO.2
+        
+        Examples:
+            >>> get_panel_number('P31-021-01-PN')  # 3[1] → 홀수 → NO.1
+            1
+            >>> get_panel_number('P32-015-03-PN')  # 3[2] → 짝수 → NO.2
+            2
+            >>> get_panel_number('P41-023-02-PN')  # 4[1] → 홀수 → NO.1
+            1
+            >>> get_panel_number('P42-012-05-PN')  # 4[2] → 짝수 → NO.2
+            2
+        """
+        match = re.match(r'^[A-Z](\d)(\d)-', circuit_no)
+        if match:
+            second_digit = int(match.group(2))
+            # 짝수면 NO.2, 홀수면 NO.1
+            return 2 if second_digit % 2 == 0 else 1
+        return None
+    
+    
+    def _find_table_with_placeholder(self, placeholder):
+        for t_idx, table in enumerate(self.doc.tables):
+            for r_idx, row in enumerate(table.rows):
+                for cell in row.cells:
+                    if placeholder in cell.text:
+                        return (t_idx, r_idx)
+        return None
+    
+    def _clone_row(self, table, row_index):
+        original_row = table.rows[row_index]
+        new_row_element = deepcopy(original_row._element)
+        table._element.append(new_row_element)
+        return table.rows[-1]
+    
+    def _replace_placeholders_in_cell(self, cell, replacements):
+        for paragraph in cell.paragraphs:
+            for key, value in replacements.items():
+                if key in paragraph.text:
+                    for run in paragraph.runs:
+                        if key in run.text:
+                            run.text = run.text.replace(key, str(value))
+    
+    def fill_panel_information_dynamic(self, panel_data):
+        """PANEL INFORMATION 동적 생성"""
+        result = self._find_table_with_placeholder("{{panel_name_1}}")
+        if not result:
+            print("[INFO] PANEL INFORMATION 표 없음 (스킵)")
+            return
+        
+        table_idx, template_row_idx = result
+        table = self.doc.tables[table_idx]
+        print(f"\n[INFO] PANEL INFORMATION 표 발견: Table {table_idx+1}")
+        template_row = table.rows[template_row_idx]
+        
+        for idx, item in enumerate(panel_data):
+            # ✅ v3.4.3: 첫 번째 행도 복제하여 템플릿 보존!
+            new_row = self._clone_row(table, template_row_idx)
+            
+            replacements = {
+                '{{panel_name_1}}': item.get('panel', ''),
+                '{{panel_acb_type_1}}': item.get('acb_type', ''),
+                '{{panel_ocr_type_1}}': item.get('ocr_type', ''),
+                '{{panel_frame_1}}': item.get('ampere_frame', ''),
+                '{{panel_rated_1}}': item.get('rated_current_in', ''),
+                '{{panel_ir_pct_1}}': item.get('ir_percent', ''),
+                '{{panel_ir_amp_1}}': item.get('ir_amps', ''),
+                '{{panel_isd_1}}': '', '{{panel_key_1}}': '',
+                '{{panel_set_1}}': '', '{{panel_time_1}}': ''
+            }
+            for cell in new_row.cells:
+                self._replace_placeholders_in_cell(cell, replacements)
+            print(f"  ✓ {item.get('panel', '')} 추가")
+        
+        # ✅ v3.4.3: 템플릿 행 삭제
+        table._element.remove(template_row._element)
+        print(f"  최종 행 개수: {len(table.rows)}")
+    
+    def fill_gsp_function_test_dynamic(self, gsp_data):
+        """GSP FUNCTION TEST 동적 생성 - NO.1과 NO.2 섹션 분리 (범용)"""
+        # NO.1과 NO.2 데이터 분리
+        no1_circuits = []
+        no2_circuits = []
+        
+        print(f"\n[DEBUG] ===== GSP 데이터 구조 분석 시작 =====")
+        print(f"[DEBUG] gsp_data 타입: {type(gsp_data)}")
+        print(f"[DEBUG] gsp_data 길이: {len(gsp_data) if isinstance(gsp_data, (list, dict)) else 'N/A'}")
+        
+        for panel_idx, panel_item in enumerate(gsp_data):
+            print(f"\n[DEBUG] Panel {panel_idx+1}:")
+            print(f"  타입: {type(panel_item)}")
+            
+            panel_name = panel_item.get('panel_name', '') if isinstance(panel_item, dict) else ''
+            rows = panel_item.get('rows', []) if isinstance(panel_item, dict) else []
+            
+            print(f"  panel_name: {panel_name}")
+            print(f"  rows 타입: {type(rows)}")
+            print(f"  rows 길이: {len(rows) if isinstance(rows, (list, dict)) else 'N/A'}")
+            
+            # ✅ v3.4.9: 데이터 구조 자동 감지 및 처리
+            if isinstance(rows, dict):
+                # 딕셔너리 구조: {circuit_no: [values]}
+                print(f"  [구조] 딕셔너리 ({len(rows)}개 Circuit)")
+                print(f"  [샘플] 첫 3개 키: {list(rows.keys())[:3]}")
+                
+                for circuit_no, values in rows.items():
+                    # Circuit No 유효성 검사
+                    if self.is_valid_circuit_no(circuit_no):
+                        # circuit_name 추출
+                        circuit_name = ""
+                        if isinstance(values, list):
+                            for val in values:
+                                if isinstance(val, str) and len(val) > 10 and not val.replace('.', '').replace('-', '').isdigit():
+                                    circuit_name = val
+                                    break
+                        
+                        row_data = {
+                            'circuit_no': circuit_no,
+                            'circuit_name': circuit_name
+                        }
+                        
+                        # Panel 번호로 자동 분리
+                        panel_num = self.get_panel_number(circuit_no)
+                        if panel_num == 1:
+                            no1_circuits.append(row_data)
+                        elif panel_num == 2:
+                            no2_circuits.append(row_data)
+            
+            elif isinstance(rows, list) and len(rows) > 0:
+                # 리스트 구조
+                print(f"  [구조] 리스트 ({len(rows)}개 행)")
+                
+                # 첫 번째 항목 분석
+                first_row = rows[0]
+                print(f"  [샘플] 첫 번째 행 타입: {type(first_row)}")
+                
+                if isinstance(first_row, dict):
+                    # 리스트 of 딕셔너리
+                    print(f"  [샘플] 첫 번째 행 키: {list(first_row.keys())[:5]}")
+                    
+                    valid_rows = []
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        
+                        circuit_no = row.get('circuit_no', '')
+                        
+                        # Circuit No 형식 검증
+                        if self.is_valid_circuit_no(circuit_no):
+                            valid_rows.append(row)
+                    
+                    print(f"  [필터링] {len(rows)}개 → {len(valid_rows)}개 (유효)")
+                    
+                    # Panel 번호로 자동 분리
+                    for row in valid_rows:
+                        circuit_no = row.get('circuit_no', '')
+                        panel_num = self.get_panel_number(circuit_no)
+                        
+                        if panel_num == 1:
+                            no1_circuits.append(row)
+                        elif panel_num == 2:
+                            no2_circuits.append(row)
+                
+                else:
+                    # 리스트 of 기타 (문자열, 숫자 등)
+                    print(f"  [샘플] 첫 번째 행 값: {first_row}")
+                    print(f"  [경고] 예상치 못한 데이터 구조 - 건너뜀")
+        
+        print(f"\n[DEBUG] ===== GSP 데이터 구조 분석 완료 =====")
+        print(f"[DEBUG] NO.1 GSP: {len(no1_circuits)}개 Circuit (필터링 후)")
+        print(f"[DEBUG] NO.2 GSP: {len(no2_circuits)}개 Circuit (필터링 후)")
+        
+        # NO.1 샘플 출력
+        if no1_circuits:
+            print(f"[DEBUG] NO.1 샘플 (첫 3개):")
+            for circ in no1_circuits[:3]:
+                print(f"  - {circ.get('circuit_no', 'N/A')}: {circ.get('circuit_name', 'N/A')}")
+        
+        # NO.2 샘플 출력
+        if no2_circuits:
+            print(f"[DEBUG] NO.2 샘플 (첫 3개):")
+            for circ in no2_circuits[:3]:
+                print(f"  - {circ.get('circuit_no', 'N/A')}: {circ.get('circuit_name', 'N/A')}")
+        
+        # ✅ v3.4.9: NO.1 섹션 처리
+        result_no1 = self._find_table_with_placeholder("{{gsp_circuit_1}}")
+        if result_no1:
+            table_idx, template_row_idx = result_no1
+            table = self.doc.tables[table_idx]
+            print(f"\n[INFO] GSP FUNCTION TEST (NO.1) 표 발견: Table {table_idx+1}")
+            template_row = table.rows[template_row_idx]
+            
+            for circuit in no1_circuits:
+                new_row = self._clone_row(table, template_row_idx)
+                replacements = {
+                    '{{gsp_circuit_1}}': circuit.get('circuit_no', ''),
+                    '{{gsp_name_1}}': circuit.get('circuit_name', ''),
+                    '{{gsp_local_1}}': '□', '{{gsp_remote_1}}': '□',
+                    '{{gsp_heater_1}}': '□', '{{gsp_phase_1}}': '□',
+                    '{{gsp_remark_1}}': ''
+                }
+                for cell in new_row.cells:
+                    self._replace_placeholders_in_cell(cell, replacements)
+            
+            # 템플릿 행 삭제
+            table._element.remove(template_row._element)
+            print(f"  ✓ NO.1: {len(no1_circuits)}개 Circuit 추가")
+        else:
+            print("[INFO] GSP FUNCTION TEST (NO.1) 표 없음 (스킵)")
+        
+        # ✅ v3.4.9: NO.2 섹션 처리
+        result_no2 = self._find_table_with_placeholder("{{gsp_circuit_2}}")
+        if result_no2:
+            table_idx, template_row_idx = result_no2
+            table = self.doc.tables[table_idx]
+            print(f"\n[INFO] GSP FUNCTION TEST (NO.2) 표 발견: Table {table_idx+1}")
+            template_row = table.rows[template_row_idx]
+            
+            for circuit in no2_circuits:
+                new_row = self._clone_row(table, template_row_idx)
+                replacements = {
+                    '{{gsp_circuit_2}}': circuit.get('circuit_no', ''),
+                    '{{gsp_name_2}}': circuit.get('circuit_name', ''),
+                    '{{gsp_local_2}}': '□', '{{gsp_remote_2}}': '□',
+                    '{{gsp_heater_2}}': '□', '{{gsp_phase_2}}': '□',
+                    '{{gsp_remark_2}}': ''
+                }
+                for cell in new_row.cells:
+                    self._replace_placeholders_in_cell(cell, replacements)
+            
+            # 템플릿 행 삭제
+            table._element.remove(template_row._element)
+            print(f"  ✓ NO.2: {len(no2_circuits)}개 Circuit 추가")
+        else:
+            print("[INFO] GSP FUNCTION TEST (NO.2) 표 없음 (스킵)")
+        
+        print(f"  최종 행 개수: {len(self.doc.tables[table_idx].rows) if result_no1 or result_no2 else 0}")
+    
+    
+    def fill_emergency_table_dynamic(self, emergency_data):
+        """EMERGENCY STOP 동적 생성"""
+        result = self._find_table_with_placeholder("{{emcy_code_1}}")
+        if not result:
+            print("[INFO] EMERGENCY 표 없음 (스킵)")
+            return
+        
+        table_idx, template_row_idx = result
+        table = self.doc.tables[table_idx]
+        print(f"\n[INFO] EMERGENCY 표 발견: Table {table_idx+1}")
+        template_row = table.rows[template_row_idx]
+        
+        for idx, item in enumerate(emergency_data):
+            # ✅ v3.4.3: 첫 번째 행도 복제하여 템플릿 보존!
+            new_row = self._clone_row(table, template_row_idx)
+            
+            circuit_text = ""
+            groups_list = item.get('groups', [])
+            
+            for group in groups_list:
+                panel_header = group.get('panel_header', '')
+                circuits = group.get('circuits', [])
+                
+                circuit_text += f"[{panel_header}]\n"
+                for i in range(0, len(circuits), 3):
+                    chunk = circuits[i:i+3]
+                    circuit_text += ", ".join(chunk)
+                    circuit_text += ",\n" if i + 3 < len(circuits) else "\n"
+                circuit_text += "\n"
+            circuit_text = circuit_text.strip()
+            
+            replacements = {
+                '{{emcy_code_1}}': item.get('code', ''),
+                '{{emcy_color_1}}': item.get('color', ''),
+                '{{emcy_name_1}}': item.get('name', ''),
+                '{{emcy_circuit_1}}': circuit_text
+            }
+            for cell in new_row.cells:
+                self._replace_placeholders_in_cell(cell, replacements)
+            print(f"  ✓ {item.get('code', '')} 추가")
+        
+        # ✅ v3.4.3: 템플릿 행 삭제
+        table._element.remove(template_row._element)
+        print(f"  최종 행 개수: {len(table.rows)}")
+    
+    def fill_preferential_table_dynamic(self, preferential_data):
+        """PREFERENTIAL TRIP 동적 생성 (NO1/NO2 분리, 범용)"""
+        result = self._find_table_with_placeholder("{{pref_code_1}}")
+        if not result:
+            print("[INFO] PREFERENTIAL 표 없음 (스킵)")
+            return
+        
+        table_idx, template_row_idx = result
+        table = self.doc.tables[table_idx]
+        print(f"\n[INFO] PREFERENTIAL 표 발견: Table {table_idx+1}")
+        template_row = table.rows[template_row_idx]
+        
+        for idx, item in enumerate(preferential_data):
+            # ✅ v3.4.3: 첫 번째 행도 복제하여 템플릿 보존!
+            new_row = self._clone_row(table, template_row_idx)
+            
+            # ✅ v3.4.7: 두 가지 데이터 구조 지원 + 범용 분리
+            no1_circuits = []
+            no2_circuits = []
+            
+            # groups 구조 처리
+            groups_list = item.get('groups', [])
+            if groups_list:
+                for group in groups_list:
+                    panel_header = group.get('panel_header', '')
+                    circuits = group.get('circuits', [])
+                    
+                    if 'No.1' in panel_header or 'NO.1' in panel_header:
+                        no1_circuits.extend(circuits)
+                    elif 'No.2' in panel_header or 'NO.2' in panel_header:
+                        no2_circuits.extend(circuits)
+            else:
+                # ✅ v3.4.7: circuits 구조 처리 (범용 자동 분리)
+                circuits = item.get('circuits', [])
+                for circuit in circuits:
+                    # Circuit No 유효성 검사
+                    if self.is_valid_circuit_no(circuit):
+                        panel_num = self.get_panel_number(circuit)
+                        if panel_num == 1:
+                            no1_circuits.append(circuit)
+                        elif panel_num == 2:
+                            no2_circuits.append(circuit)
+            
+            print(f"  [DEBUG] {item.get('code', '')}: NO.1={len(no1_circuits)}개, NO.2={len(no2_circuits)}개")
+            
+            # NO1 텍스트 생성 (3개씩 묶어서)
+            no1_text = ""
+            for i in range(0, len(no1_circuits), 3):
+                chunk = no1_circuits[i:i+3]
+                no1_text += ", ".join(chunk)
+                if i + 3 < len(no1_circuits):
+                    no1_text += ",\n"
+            
+            # NO2 텍스트 생성 (3개씩 묶어서)
+            no2_text = ""
+            for i in range(0, len(no2_circuits), 3):
+                chunk = no2_circuits[i:i+3]
+                no2_text += ", ".join(chunk)
+                if i + 3 < len(no2_circuits):
+                    no2_text += ",\n"
+            
+            # COLOR 괄호 처리
+            color = item.get('color', '').strip()
+            if color and not color.startswith('('):
+                color = f"({color})"
+            
+            replacements = {
+                '{{pref_code_1}}': item.get('code', ''),
+                '{{pref_color_1}}': color,
+                '{{pref_no1_circuit_1}}': no1_text,  # NO1 Panel
+                '{{pref_no2_circuit_1}}': no2_text   # NO2 Panel
+            }
+            for cell in new_row.cells:
+                self._replace_placeholders_in_cell(cell, replacements)
+            print(f"  ✓ {item.get('code', '')} 추가")
+        
+        # ✅ v3.4.3: 템플릿 행 삭제
+        table._element.remove(template_row._element)
+        print(f"  최종 행 개수: {len(table.rows)}")
+
+
 
 class App(tk.Tk):
     @staticmethod
@@ -870,16 +1297,19 @@ class App(tk.Tk):
         self.after(0, ui_done)
 
     def _generate_worker(self):
+        """v3.3.0 FINAL 보고서 생성 - 동적 행 생성 포함"""
         tpl = self.template_path.get().strip()
         if not os.path.isfile(tpl):
             self.after(0, lambda: messagebox.showerror("오류", "템플릿 DOCX를 먼저 선택하세요."))
             return
+        
         ctx = {k:(self.entries[k].get().strip() if k in self.entries else '') for k in FIELDS}
         sel_hull = self.selected_hull.get().strip()
         if sel_hull:
             ctx["hull_no"] = sel_hull
             ctx["class"] = self.hull_to_class.get(sel_hull) or ctx.get("class","") or self.class_var.get().strip()
         ctx.update(self._panel_collect_placeholders())
+        
         gsp_panels_ctx = self._gsp_collect_from_ui()
         placeholder_map = {item.get("placeholder"): item for item in gsp_panels_ctx}
         for _, placeholder in self.gsp_function_slots:
@@ -896,16 +1326,132 @@ class App(tk.Tk):
             }
             for item in gsp_panels_ctx
         ]
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 동적 행 생성용 데이터 준비
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        # 1. PANEL INFORMATION
+        panel_data = self.panels_data if hasattr(self, 'panels_data') and self.panels_data else []
+        
+        # 2. FUNCTION TEST OF GSP
+        gsp_function_data = self.gsp_function_data if hasattr(self, 'gsp_function_data') and self.gsp_function_data else []
+        
+        # 3. EMERGENCY STOP / PREFERENTIAL TRIP
+        emergency_data = self.em_stops_data if hasattr(self, 'em_stops_data') and self.em_stops_data else []
+        preferential_data = self.pt_trips_data if hasattr(self, 'pt_trips_data') and self.pt_trips_data else []
+        
+        if panel_data:
+            self.log(f"[INFO] Panel: {len(panel_data)}개")
+        if gsp_function_data:
+            self.log(f"[INFO] GSP: {len(gsp_function_data)}개 Panel")
+        if emergency_data or preferential_data:
+            self.log(f"[INFO] Emergency: {len(emergency_data)}개, Preferential: {len(preferential_data)}개")
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 동적 플레이스홀더를 ctx에 추가 (DocxTemplate이 건드리지 않도록)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 중요: DocxTemplate.render()는 ctx에 없는 {{...}} 플레이스홀더를 삭제할 수 있음
+        # 따라서 동적으로 사용할 플레이스홀더들을 빈 값이 아닌 자기 자신으로 설정
+        dynamic_placeholders = {
+            # PANEL INFORMATION - 자기 자신으로 설정하여 보존
+            'panel_name_1': '{{panel_name_1}}',
+            'panel_acb_type_1': '{{panel_acb_type_1}}',
+            'panel_ocr_type_1': '{{panel_ocr_type_1}}',
+            'panel_frame_1': '{{panel_frame_1}}',
+            'panel_rated_1': '{{panel_rated_1}}',
+            'panel_ir_pct_1': '{{panel_ir_pct_1}}',
+            'panel_ir_amp_1': '{{panel_ir_amp_1}}',
+            'panel_isd_1': '{{panel_isd_1}}',
+            'panel_key_1': '{{panel_key_1}}',
+            'panel_set_1': '{{panel_set_1}}',
+            'panel_time_1': '{{panel_time_1}}',
+            
+            # GSP FUNCTION TEST
+            'gsp_circuit_1': '{{gsp_circuit_1}}',
+            'gsp_name_1': '{{gsp_name_1}}',
+            'gsp_local_1': '{{gsp_local_1}}',
+            'gsp_remote_1': '{{gsp_remote_1}}',
+            'gsp_heater_1': '{{gsp_heater_1}}',
+            'gsp_phase_1': '{{gsp_phase_1}}',
+            'gsp_remark_1': '{{gsp_remark_1}}',
+            
+            # EMERGENCY STOP
+            'emcy_code_1': '{{emcy_code_1}}',
+            'emcy_color_1': '{{emcy_color_1}}',
+            'emcy_name_1': '{{emcy_name_1}}',
+            'emcy_circuit_1': '{{emcy_circuit_1}}',
+            
+            # PREFERENTIAL TRIP
+            'pref_code_1': '{{pref_code_1}}',
+            'pref_color_1': '{{pref_color_1}}',
+            'pref_name_1': '{{pref_name_1}}',
+            'pref_circuit_1': '{{pref_circuit_1}}',
+        }
+        ctx.update(dynamic_placeholders)
+        self.log("[DEBUG] 동적 플레이스홀더 보존 설정 완료")
+        
         try:
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 1단계: DocxTemplate로 기본 placeholder 치환
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             doc = DocxTemplate(tpl)
             doc.render(ctx)
+            
+            # 임시 파일로 저장
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.docx')
+            temp_path = temp_file.name
+            temp_file.close()
+            doc.save(temp_path)
+            
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 2단계: DynamicTemplateFiller로 동적 행 생성
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            filler = DynamicTemplateFiller(temp_path)
+            
+            if panel_data:
+                self.log("[INFO] PANEL TABLE 동적 생성...")
+                filler.fill_panel_information_dynamic(panel_data)
+            
+            if gsp_function_data:
+                self.log("[INFO] GSP TABLE 동적 생성...")
+                filler.fill_gsp_function_test_dynamic(gsp_function_data)
+            
+            if emergency_data:
+                self.log("[INFO] EMERGENCY TABLE 동적 생성...")
+                filler.fill_emergency_table_dynamic(emergency_data)
+            
+            if preferential_data:
+                self.log("[INFO] PREFERENTIAL TABLE 동적 생성...")
+                filler.fill_preferential_table_dynamic(preferential_data)
+            
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 3단계: 최종 파일로 저장
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             hull = ctx.get("hull_no","SNXXXX")
             now = datetime.datetime.now().strftime("%Y%m%d_%H%M")
             out_path = os.path.join(self.save_dir.get().strip() or os.getcwd(), f"FAT_Report_{hull}_{now}.docx")
-            doc.save(out_path)
-            self.after(0, lambda: [self.log(f"[OK] 보고서 생성 완료: {out_path}"), messagebox.showinfo("완료", f"보고서 생성 완료:\n{out_path}")])
+            
+            filler.doc.save(out_path)
+            
+            # 임시 파일 삭제
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+            
+            self.after(0, lambda: [
+                self.log(f"[OK] 보고서 생성 완료: {out_path}"),
+                messagebox.showinfo("완료", f"보고서 생성 완료:\n{out_path}")
+            ])
+            
         except Exception as e:
-            self.after(0, lambda: [self.log(f"[ERROR] 보고서 생성 실패: {e}"), messagebox.showerror("오류", f"보고서 생성 실패:\n{e}")])
+            self.after(0, lambda: [
+                self.log(f"[ERROR] 보고서 생성 실패: {e}"),
+                messagebox.showerror("오류", f"보고서 생성 실패:\n{e}")
+            ])
+            import traceback
+            traceback.print_exc()
 
 
     def _panel_fill_ui(self):
@@ -1118,9 +1664,9 @@ class App(tk.Tk):
         for g in e.get("groups", []):
             header = g.get("panel_header","")
             circs = ", ".join(g.get("circuits", []))
-            prefix = f"{code} " if code else ""
+            # CODE prefix 제거 - header만 표시
             body = circs if circs else ""
-            blocks.append(f"{prefix}[{header}]\n{body}".strip())
+            blocks.append(f"[{header}]\n{body}".strip())
         self.txt_em_circuits.delete("1.0","end")
         self.txt_em_circuits.insert("1.0","\n\n".join(blocks))
 
@@ -1256,9 +1802,9 @@ class App(tk.Tk):
         for g in e.get("groups", []):
             header = g.get("panel_header","")
             circs = ", ".join(g.get("circuits", []))
-            prefix = f"{code} " if code else ""
+            # CODE prefix 제거 - header만 표시
             body = circs if circs else ""
-            blocks.append(f"{prefix}[{header}]\n{body}".strip())
+            blocks.append(f"[{header}]\n{body}".strip())
         self.txt_pt_circuits.delete("1.0","end")
         self.txt_pt_circuits.insert("1.0","\n\n".join(blocks))
 
