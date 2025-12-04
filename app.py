@@ -1375,18 +1375,25 @@ class App(tk.Tk):
             'gsp_heater_1': '{{gsp_heater_1}}',
             'gsp_phase_1': '{{gsp_phase_1}}',
             'gsp_remark_1': '{{gsp_remark_1}}',
+            'gsp_circuit_2': '{{gsp_circuit_2}}',
+            'gsp_name_2': '{{gsp_name_2}}',
+            'gsp_local_2': '{{gsp_local_2}}',
+            'gsp_remote_2': '{{gsp_remote_2}}',
+            'gsp_heater_2': '{{gsp_heater_2}}',
+            'gsp_phase_2': '{{gsp_phase_2}}',
+            'gsp_remark_2': '{{gsp_remark_2}}',
             
             # EMERGENCY STOP
             'emcy_code_1': '{{emcy_code_1}}',
             'emcy_color_1': '{{emcy_color_1}}',
             'emcy_name_1': '{{emcy_name_1}}',
             'emcy_circuit_1': '{{emcy_circuit_1}}',
-            
+
             # PREFERENTIAL TRIP
             'pref_code_1': '{{pref_code_1}}',
             'pref_color_1': '{{pref_color_1}}',
-            'pref_name_1': '{{pref_name_1}}',
-            'pref_circuit_1': '{{pref_circuit_1}}',
+            'pref_no1_circuit_1': '{{pref_no1_circuit_1}}',
+            'pref_no2_circuit_1': '{{pref_no2_circuit_1}}',
         }
         ctx.update(dynamic_placeholders)
         self.log("[DEBUG] 동적 플레이스홀더 보존 설정 완료")
