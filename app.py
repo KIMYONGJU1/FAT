@@ -276,6 +276,14 @@ class DynamicTemplateFiller:
             print(f"  타입: {type(panel_item)}")
             
             panel_name = panel_item.get('panel_name', '') if isinstance(panel_item, dict) else ''
+            panel_hint = None
+            placeholder = panel_item.get('placeholder', '') if isinstance(panel_item, dict) else ''
+            if isinstance(placeholder, str):
+                if 'no1' in placeholder.lower():
+                    panel_hint = 1
+                elif 'no2' in placeholder.lower():
+                    panel_hint = 2
+
             rows = panel_item.get('rows', []) if isinstance(panel_item, dict) else []
             
             print(f"  panel_name: {panel_name}")
@@ -305,7 +313,7 @@ class DynamicTemplateFiller:
                         }
                         
                         # Panel 번호로 자동 분리
-                        panel_num = self.get_panel_number(circuit_no)
+                        panel_num = self.get_panel_number(circuit_no) or panel_hint
                         if panel_num == 1:
                             no1_circuits.append(row_data)
                         elif panel_num == 2:
@@ -339,7 +347,7 @@ class DynamicTemplateFiller:
                     # Panel 번호로 자동 분리
                     for row in valid_rows:
                         circuit_no = row.get('circuit_no', '')
-                        panel_num = self.get_panel_number(circuit_no)
+                        panel_num = self.get_panel_number(circuit_no) or panel_hint
                         
                         if panel_num == 1:
                             no1_circuits.append(row)
@@ -1375,18 +1383,25 @@ class App(tk.Tk):
             'gsp_heater_1': '{{gsp_heater_1}}',
             'gsp_phase_1': '{{gsp_phase_1}}',
             'gsp_remark_1': '{{gsp_remark_1}}',
+            'gsp_circuit_2': '{{gsp_circuit_2}}',
+            'gsp_name_2': '{{gsp_name_2}}',
+            'gsp_local_2': '{{gsp_local_2}}',
+            'gsp_remote_2': '{{gsp_remote_2}}',
+            'gsp_heater_2': '{{gsp_heater_2}}',
+            'gsp_phase_2': '{{gsp_phase_2}}',
+            'gsp_remark_2': '{{gsp_remark_2}}',
             
             # EMERGENCY STOP
             'emcy_code_1': '{{emcy_code_1}}',
             'emcy_color_1': '{{emcy_color_1}}',
             'emcy_name_1': '{{emcy_name_1}}',
             'emcy_circuit_1': '{{emcy_circuit_1}}',
-            
+
             # PREFERENTIAL TRIP
             'pref_code_1': '{{pref_code_1}}',
             'pref_color_1': '{{pref_color_1}}',
-            'pref_name_1': '{{pref_name_1}}',
-            'pref_circuit_1': '{{pref_circuit_1}}',
+            'pref_no1_circuit_1': '{{pref_no1_circuit_1}}',
+            'pref_no2_circuit_1': '{{pref_no2_circuit_1}}',
         }
         ctx.update(dynamic_placeholders)
         self.log("[DEBUG] 동적 플레이스홀더 보존 설정 완료")
@@ -1521,6 +1536,20 @@ class App(tk.Tk):
         return None
 
     @staticmethod
+    def _normalize_gsp_row(row: Dict[str, object]) -> Dict[str, str]:
+        code = ""
+        name = ""
+        order = 0
+        if isinstance(row, dict):
+            code = row.get("code") or row.get("circuit_no") or ""
+            name = row.get("name") or row.get("circuit_name") or ""
+            try:
+                order = int(row.get("order", 0))
+            except Exception:
+                order = 0
+        return {"code": str(code).strip(), "name": str(name).strip(), "order": order}
+
+    @staticmethod
     def _circuit_sort_key(code: str) -> tuple:
         pattern = re.compile(r'P(\d+)-(\d+)-(\d+)-([A-Z]+)', re.I)
         m = pattern.match(code or "")
@@ -1537,7 +1566,7 @@ class App(tk.Tk):
                 data_map[key] = dict(item)
         for label, placeholder in self.gsp_function_slots:
             entry = data_map.get(placeholder) or {"panel": label, "rows": []}
-            rows = entry.get("rows") or []
+            rows = [self._normalize_gsp_row(r) for r in (entry.get("rows") or [])]
             sorted_rows = sorted(
                 rows,
                 key=lambda r: (self._circuit_sort_key(r.get("code", "")), r.get("order", 0)),
@@ -1568,7 +1597,7 @@ class App(tk.Tk):
             if tree:
                 for child in tree.get_children():
                     tree.delete(child)
-                rows = data_map.get(placeholder, {}).get("rows") or []
+                rows = [self._normalize_gsp_row(r) for r in (data_map.get(placeholder, {}).get("rows") or [])]
                 if rows:
                     sorted_rows = sorted(
                         rows,
