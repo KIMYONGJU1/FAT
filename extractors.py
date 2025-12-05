@@ -674,7 +674,7 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
     if len(remaining) >= 1:
         slot_assignment["no1"] = remaining[0]
         print(f"  ✓ no1: X={slot_assignment['no1']:.1f}")
-        
+
         # NO.2는 NO.1과 같은 위치 or 다음 클러스터
         if len(remaining) >= 2:
             slot_assignment["no2"] = remaining[1]
@@ -683,7 +683,69 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
             # 클러스터가 하나만 있으면 NO.1과 같은 위치로 설정
             slot_assignment["no2"] = remaining[0]
             print(f"  ✓ no2: X={slot_assignment['no2']:.1f} (no1과 동일 위치)")
-    
+
+    # 보조 정보: 텍스트 기반 슬롯 범위로 보간
+    word_ranges = _slot_ranges_from_words(words)
+    for slot in ["no1", "no2", "bus", "emg"]:
+        if slot not in slot_assignment and slot in word_ranges:
+            left, right = word_ranges[slot]
+            slot_assignment[slot] = (left + right) / 2.0
+            print(f"  ✓ {slot}: 텍스트 기반 추정 X={(left + right) / 2.0:.1f} (range {left:.1f}~{right:.1f})")
+
+    # 보간 규칙: NO.1/NO.2/버스가 한쪽으로 뭉쳤을 때 균등 분할
+    if "no2" not in slot_assignment and "no1" in slot_assignment and "bus" in slot_assignment:
+        slot_assignment["no2"] = (slot_assignment["no1"] + slot_assignment["bus"]) / 2.0
+        print(f"  ✓ no2: no1-bus 중간값 보간 → X={slot_assignment['no2']:.1f}")
+    if "no1" not in slot_assignment and "no2" in slot_assignment and "bus" in slot_assignment:
+        gap = slot_assignment["bus"] - slot_assignment["no2"]
+        slot_assignment["no1"] = slot_assignment["no2"] - gap
+        print(f"  ✓ no1: no2 기준 좌측 보간 → X={slot_assignment['no1']:.1f}")
+
+    # 중복 X 보정 (폭 계산 시 0이 되지 않도록 약간씩 이동)
+    deduped_assignment = {}
+    for slot, cx in sorted(slot_assignment.items(), key=lambda x: x[1]):
+        while any(abs(cx - v) < 0.1 for v in deduped_assignment.values()):
+            cx += 0.2
+        deduped_assignment[slot] = cx
+    slot_assignment = deduped_assignment
+
+    # 슬롯 간격이 비정상적으로 겹치면 보간으로 재배치 (특히 no1/no2)
+    def _gap(slot_a: str, slot_b: str) -> Optional[float]:
+        if slot_a in slot_assignment and slot_b in slot_assignment:
+            return abs(slot_assignment[slot_a] - slot_assignment[slot_b])
+        return None
+
+    # 패널 간격을 BUS~EMG 간격 기준으로 재정렬해 좌우 폭을 맞춤
+    if "bus" in slot_assignment and "emg" in slot_assignment:
+        target_spacing = abs(slot_assignment["emg"] - slot_assignment["bus"])
+
+        # NO.2가 없거나 BUS와의 간격이 비정상적으로 작으면 BUS 기준 간격 재배치
+        if "no2" not in slot_assignment or abs(slot_assignment["bus"] - slot_assignment["no2"]) < target_spacing * 0.6:
+            slot_assignment["no2"] = slot_assignment["bus"] - target_spacing
+            print(f"  ✓ no2: bus 간격({target_spacing:.1f}px) 기반 좌측 재배치 → X={slot_assignment['no2']:.1f}")
+
+        # NO.1이 없거나 NO.2와 너무 가까우면 동일 간격으로 한 칸 더 좌측으로 배치
+        gap_no1_no2 = _gap("no1", "no2")
+        if "no2" in slot_assignment and ("no1" not in slot_assignment or (gap_no1_no2 is not None and gap_no1_no2 < target_spacing * 0.6)):
+            slot_assignment["no1"] = slot_assignment["no2"] - target_spacing
+            print(f"  ✓ no1: no2 간격({target_spacing:.1f}px) 기반 좌측 재배치 → X={slot_assignment['no1']:.1f}")
+
+    # NO.2가 NO.1과 겹치거나 너무 가까운 경우 → NO.1과 BUS 사이 중간으로 이동
+    gap_no1_no2 = _gap("no1", "no2")
+    if gap_no1_no2 is not None and gap_no1_no2 < 30 and "no1" in slot_assignment:
+        if "bus" in slot_assignment:
+            slot_assignment["no2"] = (slot_assignment["no1"] + slot_assignment["bus"]) / 2.0
+            print(f"  ✓ no2: no1-bus 중간값 재보간 → X={slot_assignment['no2']:.1f} (gap {gap_no1_no2:.1f}px)")
+        elif "emg" in slot_assignment:
+            slot_assignment["no2"] = (slot_assignment["no1"] + slot_assignment["emg"]) / 2.0
+            print(f"  ✓ no2: no1-emg 중간값 재보간 → X={slot_assignment['no2']:.1f} (gap {gap_no1_no2:.1f}px)")
+
+    # NO.1이 없거나 NO.2와 과도하게 겹칠 때 → BUS 기준 좌측 대칭 위치 계산
+    if ("no1" not in slot_assignment or (gap_no1_no2 is not None and gap_no1_no2 < 30)) and "no2" in slot_assignment and "bus" in slot_assignment:
+        gap = slot_assignment["bus"] - slot_assignment["no2"]
+        slot_assignment["no1"] = slot_assignment["no2"] - gap
+        print(f"  ✓ no1: bus-no2 간격 대칭 보간 → X={slot_assignment['no1']:.1f}")
+
     # 폴백
     if "bus" not in slot_assignment and len(remaining) >= 1:
         slot_assignment["bus"] = remaining.pop(0)
@@ -724,10 +786,9 @@ def _determine_panel_columns(page, checkboxes: List[Dict[str, float]]) -> Dict[s
 
 def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[str, float]]) -> str:
     """
-    ACB TYPE 추출 v9 - 숫자 크기 우선순위
-    1. HGN 숫자가 클수록 우선 (63 > 50 > 32 > 10)
-    2. 같은 숫자면 거리 가까운 것 선택
-    3. PANEL 범위 100px로 확대
+    ACB TYPE 추출 v9.1 - 컬럼 중심 우선순위 개선
+    - 패널 컬럼 내부 후보를 최우선으로 선택하여 다른 컬럼(HGN63 등) 값이 섞이는 문제를 방지
+    - 거리 가중치 → 컬럼 중심/TYPE 행에 가까운 값을 우선, 숫자는 동점자 보조 지표로만 사용
     """
     words = page.extract_words() or []
     text = page.extract_text() or ""
@@ -837,7 +898,7 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
         print(f"  → TYPE 행 근처 단어를 확인하세요 (위 [1.5] 참고)")
         return ""
     
-    # STEP 3: 체크박스 기반 매칭 (숫자 크기 우선 + 거리 보조)
+    # STEP 3: 체크박스 기반 매칭 (컬럼 중심 우선)
     if checkboxes:
         print(f"  [3] 전체 체크박스: {len(checkboxes)}개")
         
@@ -847,7 +908,7 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
             return int(match.group(1)) if match else 0
         
         # PANEL 영역의 체크박스 필터링 (점진적 확대)
-        for margin in [100, 150, 200, 300]:  # 100px부터 시작 (확대)
+        for margin in [60, 100, 150]:  # 더 타이트하게 시작
             panel_checkboxes = [
                 cb for cb in checkboxes
                 if (x_min - margin) <= cb['x'] <= (x_max + margin)
@@ -897,26 +958,31 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
                 wide = "✓" if c['in_panel_wide'] else "✗"
                 print(f"      {tight}/{wide} {c['hgn']} (거리={c['dist']:.1f}, dx={c['dx']:.1f}, dy={c['dy']:.1f}, 숫자={c['hgn_num']})")
             
-            # 우선순위 1: PANEL 범위 내(±100px) + 가장 큰 숫자
-            wide_candidates = [c for c in candidates if c['in_panel_wide']]
-            
-            if wide_candidates:
-                # 숫자가 가장 큰 것들 중에서 거리가 가장 가까운 것
-                max_num = max(c['hgn_num'] for c in wide_candidates)
-                max_num_candidates = [c for c in wide_candidates if c['hgn_num'] == max_num]
-                best = min(max_num_candidates, key=lambda c: c['dist'])
-                
-                print(f"  [✓] PANEL 내 최대 숫자 선택: {best['hgn']} (거리={best['dist']:.1f}px, 숫자={best['hgn_num']})")
+            # 우선순위 1: 컬럼 내부(±50~100px) & 컬럼 중심/TYPE행과 가장 가까운 후보
+            width_priority = [c for c in candidates if c['in_panel_wide']]
+            if width_priority:
+                best = min(
+                    width_priority,
+                    key=lambda c: (
+                        abs(c['hgn_x'] - (x_min + x_max) / 2.0) + c['dist'],
+                        -c['hgn_num']
+                    ),
+                )
+                print(f"  [✓] PANEL 범위 우선 선택: {best['hgn']} (거리={best['dist']:.1f}px, 숫자={best['hgn_num']})")
                 return best['hgn']
-            
+
             # 우선순위 2: 타이트한 범위(±50px) 후보
             tight_candidates = [c for c in candidates if c['in_panel_tight']]
-            
+
             if tight_candidates:
-                max_num = max(c['hgn_num'] for c in tight_candidates)
-                max_num_candidates = [c for c in tight_candidates if c['hgn_num'] == max_num]
-                best = min(max_num_candidates, key=lambda c: c['dist'])
-                
+                best = min(
+                    tight_candidates,
+                    key=lambda c: (
+                        abs(c['hgn_x'] - (x_min + x_max) / 2.0) + c['dist'],
+                        -c['hgn_num']
+                    ),
+                )
+
                 print(f"  [✓] PANEL 타이트 범위 선택: {best['hgn']} (거리={best['dist']:.1f}px)")
                 return best['hgn']
     
@@ -929,20 +995,25 @@ def _extract_acb_type(page, x_min: float, x_max: float, checkboxes: List[Dict[st
         return int(match.group(1)) if match else 0
     
     # PANEL 범위 확대 (200px까지)
-    for margin in [100, 150, 200, 300]:
+    for margin in [60, 100, 150, 200]:
         panel_hgn = [
             h for h in all_hgn
             if (x_min - margin) <= h['x'] <= (x_max + margin)
         ]
-        
+
         if panel_hgn:
             print(f"      margin={margin}px: {len(panel_hgn)}개 HGN")
-            
-            # 가장 큰 숫자의 HGN 선택 (63 > 50 > 32 > 10)
-            best = max(panel_hgn, key=lambda h: extract_number(h['text']))
+
+            best = min(
+                panel_hgn,
+                key=lambda h: (
+                    abs(h['x'] - (x_min + x_max) / 2.0) + abs(h['y'] - type_row_y),
+                    -extract_number(h['text'])
+                ),
+            )
             best_num = extract_number(best['text'])
-            
-            print(f"  [✓] PANEL 영역 선택 (최대 숫자): {best['text']} (X={best['x']:.1f}, 숫자={best_num})")
+
+            print(f"  [✓] PANEL 영역 선택 (중심 우선): {best['text']} (X={best['x']:.1f}, 숫자={best_num})")
             return best['text']
     
     print(f"  [✗] PANEL 범위 내에 HGN이 없습니다!")
@@ -1102,6 +1173,10 @@ def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dic
     """
     AMPERE FRAME 값 추출 (800, 1000, 6300 등) - 범용성 및 정확도 개선
     PANEL 영역 내의 값만 추출, 체크박스 우선
+
+    개선점 (v4.1):
+    - 패널 영역을 타이트하게 사용(인접 컬럼 값 유입 최소화)
+    - 컬럼 중심과의 거리를 우선순위로 사용해 잘못된 대용량(6300A 등) 값 선택 방지
     """
     words = page.extract_words() or []
     text_upper = (page.extract_text() or "").upper()
@@ -1123,6 +1198,7 @@ def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dic
     
     # 프레임 값 후보들 수집 (AMPERE FRAME 행 아래, PANEL 영역 내)
     frame_values = []
+    panel_center = (x_min + x_max) / 2.0
     for word in words:
         wy = (word["top"] + word["bottom"]) / 2.0
         wx = (word["x0"] + word["x1"]) / 2.0
@@ -1131,9 +1207,10 @@ def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dic
         if not (0 < (wy - frame_y) < 200):
             continue
         
-        # PANEL 영역 내 (여유 있게)
-        if not (x_min - 50 <= wx <= x_max + 50):
-            continue
+        # PANEL 영역 내 (타이트하게, 필요 시 확장)
+        if not (x_min <= wx <= x_max):
+            if not (x_min - 25 <= wx <= x_max + 25):
+                continue
         
         text = (word.get("text") or "").strip()
         
@@ -1146,7 +1223,8 @@ def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dic
                 frame_values.append({
                     'value': num,
                     'x': wx,
-                    'y': wy
+                    'y': wy,
+                    'dist_from_center': abs(wx - panel_center)
                 })
     
     if not frame_values:
@@ -1164,24 +1242,26 @@ def _extract_ampere_frame(page, x_min: float, x_max: float, checkboxes: List[Dic
                 cb for cb in checkboxes
                 if abs(cb['y'] - fv['y']) < 40  # 같은 행 (범위 확대)
                 and abs(cb['x'] - fv['x']) < 100  # X축 거리
-                and x_min - 50 <= cb['x'] <= x_max + 50  # PANEL 영역
+                and x_min <= cb['x'] <= x_max  # PANEL 영역 (타이트)
             ]
             
             if nearby_checkboxes:
                 checked_values.append(fv['value'])
         
         if checked_values:
-            result = str(max(checked_values))
+            result = str(min(checked_values, key=lambda v: next(
+                fv['dist_from_center'] for fv in frame_values if fv['value'] == v
+            )))
             print(f"    [DEBUG] 체크박스 기반 선택: {result}")
             return result
-    
+
     # 체크박스 없으면 PANEL 영역의 가장 적절한 값 (우선순위 2)
-    panel_values = [fv['value'] for fv in frame_values if x_min - 30 <= fv['x'] <= x_max + 30]
-    
+    panel_values = [fv for fv in frame_values if x_min <= fv['x'] <= x_max]
+
     if panel_values:
-        # 여러 후보 중 중간값 선택 (노이즈 제거)
-        panel_values_sorted = sorted(panel_values)
-        result = str(panel_values_sorted[len(panel_values_sorted) // 2])
+        # 컬럼 중심과 가장 가까운 값 우선 (대형 값 오선택 방지)
+        best = min(panel_values, key=lambda fv: (fv['dist_from_center'], -fv['value']))
+        result = str(best['value'])
         print(f"    [DEBUG] PANEL 영역 기반 선택: {result}")
         return result
     
@@ -1192,6 +1272,8 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
     """
     RATED CURRENT(Io) 값 추출 (5774A, 1000A 등) - 범용성 및 정확도 개선
     PANEL 영역 내의 값만 추출
+
+    개선점 (v4.1): 패널 중심과의 거리를 우선하며, 컬럼 외부 값 유입을 최소화
     """
     words = page.extract_words() or []
     text_upper = (page.extract_text() or "").upper()
@@ -1215,6 +1297,7 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
     
     # 해당 행 및 아래 행에서 PANEL 영역의 값 찾기
     candidates = []
+    panel_center = (x_min + x_max) / 2.0
     for word in words:
         wx = (word["x0"] + word["x1"]) / 2.0
         wy = (word["top"] + word["bottom"]) / 2.0
@@ -1223,9 +1306,10 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
         if not (0 <= (wy - rated_y) <= 100):
             continue
         
-        # PANEL 영역 확인 (여유 있게)
-        if not (x_min - 50 <= wx <= x_max + 50):
-            continue
+        # PANEL 영역 확인 (타이트하게, 필요 시 ±20px 확장)
+        if not (x_min <= wx <= x_max):
+            if not (x_min - 20 <= wx <= x_max + 20):
+                continue
         
         text = (word.get("text") or "").strip()
         
@@ -1238,7 +1322,8 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
                 candidates.append({
                     'value': num,
                     'x': wx,
-                    'y': wy
+                    'y': wy,
+                    'dist_from_center': abs(wx - panel_center)
                 })
     
     if not candidates:
@@ -1248,21 +1333,13 @@ def _extract_rated_current(page, x_min: float, x_max: float) -> str:
     print(f"    [DEBUG] RATED CURRENT 후보: {[c['value'] for c in candidates]}")
     
     # PANEL 중심 영역에 가장 가까운 값 선택
-    panel_center = (x_min + x_max) / 2.0
-    best_value = None
-    min_dist = float('inf')
-    
-    for candidate in candidates:
-        # PANEL 영역 내에 있는지 확인 (타이트하게)
-        if x_min - 30 <= candidate['x'] <= x_max + 30:
-            dist = abs(candidate['x'] - panel_center)
-            if dist < min_dist:
-                min_dist = dist
-                best_value = candidate['value']
-    
-    if best_value:
-        print(f"    [DEBUG] PANEL 중심 기반 선택: {best_value}")
-        return str(best_value)
+    tight_candidates = [c for c in candidates if x_min <= c['x'] <= x_max]
+    search_pool = tight_candidates or candidates
+
+    if search_pool:
+        best = min(search_pool, key=lambda c: (c['dist_from_center'], -c['value']))
+        print(f"    [DEBUG] PANEL 중심 기반 선택: {best['value']}")
+        return str(best['value'])
     
     # 후보가 없으면 가장 큰 값 (fallback)
     values = [c['value'] for c in candidates]
